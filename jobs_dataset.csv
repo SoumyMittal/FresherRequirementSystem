@@ -1,0 +1,5 @@
+Job ID,Job Role,Number of Openings,Required Skills,Preferred Degree,Minimum CGPA
+JOB_001,AI/ML Engineer,10,"Python, Machine Learning, SQL, Statistics, Pandas, NumPy, Scikit-Learn, Deep Learning, Git","B.Tech, B.E, B.Sc, BCA",7.0
+JOB_002,Data Analyst,15,"Python, SQL, Statistics, Pandas, NumPy, Git","B.Tech, B.E, B.Sc, BCA",6.5
+JOB_003,Software Engineer,20,"Python, Java, C++, SQL, DSA, Git","B.Tech, B.E, BCA",6.5
+JOB_004,Python Developer,15,"Python, SQL, Git","B.Tech, B.E, B.Sc, BCA",6.0

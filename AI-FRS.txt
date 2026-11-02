@@ -1,0 +1,354 @@
+Yes. That actually gives us a **cleaner and more focused project**.
+
+We will stop the pipeline at **video screening**. There will be no separate coding test, aptitude test, or interview module.
+
+The final recruitment decision will be based on:
+
+**Candidate Profile + Resume + Resume Ranking + Video Screening → Final Ranking → Recruited Candidates**
+
+# Final Project Scope
+
+## AI Fresher Recruitment & Screening System
+
+```text
+┌──────────────────────────────┐
+│          CANDIDATE           │
+│                              │
+│ Register / Login             │
+│ Basic Profile                │
+│ Education                    │
+│ Skills                       │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│       RESUME UPLOAD          │
+│                              │
+│ PDF / DOCX                   │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│       RESUME PARSER          │
+│                              │
+│ PDF → Text                   │
+│ NLP Information Extraction   │
+│ Skills / Projects / Education│
+│ Internships / Certifications │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│      RESUME RANKING          │
+│                              │
+│ Job Skill Matching           │
+│ ML Suitability Score         │
+│ Candidate Ranking            │
+└──────────────┬───────────────┘
+               │
+               ▼
+       TOP CANDIDATES
+               │
+               ▼
+┌──────────────────────────────┐
+│       VIDEO SCREENING        │
+│                              │
+│ 10–15 sec Self Introduction  │
+│                              │
+│ Speech                       │
+│ NLP                          │
+│ Hand Gestures                │
+│ Body Movement                │
+│ Posture                      │
+│ Head Movement                │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│     FINAL AI EVALUATION     │
+│                              │
+│ Resume Score                 │
+│ Skill Match                  │
+│ Video Screening Score        │
+│                              │
+│ Final Candidate Ranking      │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│        RECRUITED             │
+│                              │
+│ Number of Openings = N       │
+│                              │
+│ Top N candidates recruited   │
+└──────────────────────────────┘
+```
+
+## Example
+
+Suppose a company creates:
+
+> **AI/ML Engineer — 10 Openings**
+
+And receives:
+
+**500 applications**
+
+The system could process them like this:
+
+```text
+500 Applications
+       ↓
+Eligibility
+       ↓
+500
+       ↓
+Resume AI Ranking
+       ↓
+Top 50
+       ↓
+Video Screening
+       ↓
+50 Video Scores
+       ↓
+Final Ranking
+       ↓
+Top 10
+       ↓
+🎉 10 Recruited
+```
+
+So the **number of openings directly determines the final number recruited**.
+
+---
+
+# The recruitment funnel
+
+We can make the ratios configurable.
+
+For example:
+
+| Stage            | Candidates |
+| ---------------- | ---------: |
+| Applications     |        500 |
+| Resume screening |        500 |
+| Resume shortlist |         50 |
+| Video screening  |         50 |
+| Final ranking    |         50 |
+| **Recruited**    |     **10** |
+
+If there are 20 openings:
+
+```text
+500 applicants
+     ↓
+100 resume shortlisted
+     ↓
+100 video screened
+     ↓
+Top 20
+     ↓
+20 recruited
+```
+
+If there are only 5 openings:
+
+```text
+500 applicants
+     ↓
+25 resume shortlisted
+     ↓
+25 video screened
+     ↓
+Top 5
+     ↓
+5 recruited
+```
+
+---
+
+# What happens in the video stage?
+
+This is where our project gets particularly interesting.
+
+The candidate receives something like:
+
+> **Video Screening**
+>
+> Record a 10–15 second introduction.
+>
+> Tell us:
+>
+> * Your name
+> * Your area of interest
+> * One project/achievement you're proud of
+
+The uploaded video is processed into three categories.
+
+### 🎙️ Speech
+
+```text
+Speech Duration
+Speaking Rate
+Pause Frequency
+Filler Word Rate
+Audio Quality
+```
+
+### 🧠 Content/NLP
+
+```text
+Transcript
+Response Length
+Technical Keywords
+Job Relevance
+Response Structure
+```
+
+### 👁️ Computer Vision
+
+```text
+Face Visibility
+Head Movement
+Hand Movement
+Gesture Frequency
+Body Movement
+Posture Stability
+```
+
+We can then generate:
+
+```text
+Video Screening Score = 86.4 / 100
+```
+
+I'd call this a **Communication & Delivery Score**, rather than claiming it is an objective measure of psychological confidence.
+
+---
+
+# Final ranking
+
+This is where the resume and video stages come together.
+
+For example:
+
+| Candidate | Resume | Skill Match | Video |    Final | Rank |
+| --------- | -----: | ----------: | ----: | -------: | ---: |
+| CND_042   |     92 |          95 |    88 | **91.8** |    1 |
+| CND_017   |     94 |          90 |    85 | **90.4** |    2 |
+| CND_081   |     88 |          93 |    91 | **89.9** |    3 |
+| CND_033   |     90 |          87 |    86 | **88.2** |    4 |
+| CND_059   |     86 |          89 |    84 | **86.5** |    5 |
+
+If there are **5 openings**, the top five become:
+
+```text
+CND_042 → RECRUITED
+CND_017 → RECRUITED
+CND_081 → RECRUITED
+CND_033 → RECRUITED
+CND_059 → RECRUITED
+```
+
+---
+
+# One important distinction
+
+I would keep **"shortlisted"** and **"recruited"** as two different statuses.
+
+### Resume stage
+
+```text
+APPLIED
+   ↓
+RESUME SCREENED
+   ↓
+SHORTLISTED FOR VIDEO
+```
+
+### Video stage
+
+```text
+VIDEO COMPLETED
+   ↓
+FINAL RANKING
+   ↓
+RECRUITED / NOT RECRUITED
+```
+
+So the final status could be:
+
+```text
+Applied
+Resume Shortlisted
+Video Pending
+Video Completed
+Recruited
+Not Recruited
+```
+
+---
+
+# Our project now has a very clear boundary
+
+We are **not building**:
+
+❌ Coding test
+❌ Aptitude test
+❌ Technical interview AI
+❌ Final interview automation
+
+We **are building**:
+
+✅ Candidate authentication
+✅ Candidate profile
+✅ Job creation
+✅ Number of openings
+✅ Resume upload
+✅ Resume parsing
+✅ NLP extraction
+✅ Job-specific skill matching
+✅ ML resume ranking
+✅ Resume shortlisting
+✅ 10–15 sec video screening
+✅ Speech analysis
+✅ NLP analysis
+✅ Hand gesture analysis
+✅ Body/posture analysis
+✅ Video screening score
+✅ Final candidate ranking
+✅ **Top N candidates recruited based on number of openings**
+
+That is a **very coherent project scope**.
+
+### Therefore, before we continue with `CGPA`, I would now freeze our data architecture as:
+
+```text
+1. USERS
+   └── Authentication
+
+2. CANDIDATES
+   └── Candidate profile
+
+3. JOBS
+   └── Job + number of openings + requirements
+
+4. APPLICATIONS
+   └── Candidate applies to job
+
+5. RESUMES
+   └── Uploaded resume + extracted information
+
+6. RESUME_RANKING
+   └── ML score + skill match + rank
+
+7. VIDEO_SCREENING
+   └── Audio + NLP + CV features + video score
+
+8. FINAL_RECRUITMENT
+   └── Final score + rank + recruited status
+```
+
+**This is the architecture I'd lock in now.**
+
+Then we can return to our synthetic candidate generator and continue with **academic information → skills → projects → internships → certifications**, knowing exactly where every piece of data will eventually be used.
