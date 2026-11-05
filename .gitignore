@@ -16,3 +16,9 @@ env/
 # Temporary files
 *.log
 .DS_Store
+
+# Local prototype uploads and saved reviews
+.runtime/
+node_modules/
+test-results/
+playwright-report/
