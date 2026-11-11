@@ -1,0 +1,3 @@
+# Preserve document byte offsets and archive contents across Windows checkouts.
+*.pdf binary
+*.zip binary

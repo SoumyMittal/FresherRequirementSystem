@@ -20,12 +20,16 @@ os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 
 import pymupdf as fitz
-import joblib
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from backend.pipeline import RecruitmentPipeline
+from backend.pipeline.config import MAXIMA
+from backend.pipeline.schema import RAW_COLUMNS
+from backend.pipeline.feature_engineering import make_features
+from backend.gemini_parser import extract_with_gemini, parser_status, GeminiError
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / '.runtime'
@@ -36,12 +40,15 @@ MAX_UPLOAD = 10 * 1024 * 1024
 MAX_PAGES = 15
 LOCK = threading.RLock()
 OCR_LOCK = threading.Lock()
+EXTRACTION_SLOTS = threading.Semaphore(2)
 state: dict = {'jobs': {}, 'screenings': {}, 'reviews': {}}
 dataset = pd.DataFrame()
 artifact = None
+recruitment_pipeline = None
 model_error = None
 ocr_engine = None
 model_predictions: dict[str, float] = {}
+model_recruitment_scores: dict[str, float] = {}
 raw_columns: list[str] = []
 normalizers: dict[str, float] = {}
 skill_vocabulary: list[str] = []
@@ -68,25 +75,22 @@ def persist():
 
 
 def initialize():
-    global dataset, artifact, model_error, raw_columns, normalizers, skill_vocabulary
+    global dataset, artifact, model_error, raw_columns, normalizers, skill_vocabulary, recruitment_pipeline
     UPLOADS.mkdir(parents=True, exist_ok=True)
     dataset = pd.read_csv(CSV_FILE).fillna('')
-    raw_columns = list(dataset.columns[:23])
-    normalizers = {key: float(dataset[key].max()) for key in
-                   ['Project_Count', 'Internship_Count', 'Certification_Count', 'Achievement_Count']}
+    raw_columns = list(RAW_COLUMNS)
+    normalizers = dict(MAXIMA)
     skill_vocabulary = sorted({s.strip() for value in dataset['Skills'] for s in str(value).split(',') if s.strip()}, key=len, reverse=True)
     if STATE_FILE.exists():
         loaded = json.loads(STATE_FILE.read_text(encoding='utf-8'))
         for key in state:
             state[key] = loaded.get(key, {})
     for screening in state['screenings'].values():
-        if screening['status'] in ('queued', 'extracting_text', 'ocr', 'parsing'):
+        if screening['status'] in ('queued', 'extracting_text', 'ocr', 'parsing', 'structuring', 'checking_fields'):
             screening.update(status='failed', error='Processing was interrupted. Please upload the resume again.')
     try:
-        artifact = joblib.load(ROOT / 'fresher_recruitment_model.joblib')
-        expected = set(dataset.columns) - {'Application ID', 'Candidate ID', 'Job ID', 'Recruitment_Score', 'Rank', 'Shortlist Limit', 'Shortlisted'}
-        if set(artifact['feature_columns']) != expected:
-            raise ValueError('The saved model feature contract does not match the ML CSV.')
+        recruitment_pipeline = RecruitmentPipeline()
+        artifact = recruitment_pipeline.artifact
         artifact['pipeline'].predict_proba(dataset[artifact['feature_columns']].head(1))
         model_error = None
     except Exception as exc:
@@ -157,6 +161,7 @@ def candidate_rows(job_id='', query='', selected_segment='', review=''):
                      'job': r['Job Role'], 'degree': r['Degree'], 'specialization': r['Specialization'], 'cgpa': r['CGPA'],
                      'skills': split_list(r['Skills']), 'score': float(r['Recruitment_Score']), 'probability': probability,
                      'segment': segment(probability) if probability is not None else ('Dataset Shortlist' if int(r['Shortlisted']) else 'Dataset Pool'),
+                     'recruitment_score': model_recruitment_scores.get(app_id) if probability is not None else None,
                      'source': 'ML dataset', 'review': state['reviews'].get(app_id, 'Pending')})
     jobs = {j['id']: j for j in jobs_list()}
     for s in state['screenings'].values():
@@ -166,7 +171,8 @@ def candidate_rows(job_id='', query='', selected_segment='', review=''):
         rows.append({'id': s['id'], 'candidate_id': s['candidate_id'], 'name': d.get('Full Name') or s['candidate_id'],
                      'job_id': s['job_id'], 'job': jobs[s['job_id']]['title'], 'degree': d.get('Degree'),
                      'specialization': d.get('Specialization'), 'cgpa': d.get('CGPA'), 'skills': split_list(d.get('Skills')),
-                     'score': None, 'probability': s.get('probability'), 'segment': s.get('segment', 'Needs Data Review'),
+                     'score': None, 'recruitment_score': s.get('recruitment_score') if s.get('confirmed') and s.get('probability') is not None else None,
+                     'probability': s.get('probability'), 'segment': s.get('segment', 'Needs Data Review'),
                      'source': 'Resume upload', 'review': state['reviews'].get(s['id'], 'Pending'), 'status': s['status']})
     if query:
         needle = query.casefold()
@@ -183,7 +189,8 @@ def candidate_rows(job_id='', query='', selected_segment='', review=''):
 def health():
     return {'ok': True, 'dataset': CSV_FILE.name, 'rows': len(dataset), 'model_ready': artifact is not None,
             'model_error': model_error, 'model_name': artifact['model_name'] if artifact else None,
-            'threshold': float(artifact['threshold']) if artifact else None, 'mode': 'Local prototype · mocked login'}
+            'threshold': float(artifact['threshold']) if artifact else None, 'mode': 'Local prototype · mocked login',
+            **parser_status()}
 
 
 @app.get('/api/summary')
@@ -227,6 +234,7 @@ def save_job(job_id, payload):
                 s.update(confirmed=False, probability=None, segment='Needs Data Review')
         for app_id in dataset.loc[dataset['Job ID'] == job_id, 'Application ID']:
             model_predictions.pop(app_id, None)
+            model_recruitment_scores.pop(app_id, None)
         persist()
     return job
 
@@ -253,9 +261,9 @@ def export(job_id: str = '', q: str = '', segment: str = '', review: str = ''):
     rows = candidate_rows(job_id, q, segment, review)
     out = io.StringIO(newline='')
     writer = csv.writer(out)
-    writer.writerow(['Application ID', 'Candidate', 'Job Role', 'Degree', 'CGPA', 'Dataset Score', 'Model Score', 'Segment', 'HR Review', 'Source'])
+    writer.writerow(['Application ID', 'Candidate', 'Job Role', 'Degree', 'CGPA', 'Dataset Score', 'Recruitment Score', 'Model Score', 'Segment', 'HR Review', 'Source'])
     for r in rows:
-        values = [r['id'], r['name'], r['job'], r['degree'], r['cgpa'], r['score'], r['probability'], r['segment'], r['review'], r['source']]
+        values = [r['id'], r['name'], r['job'], r['degree'], r['cgpa'], r['score'], r.get('recruitment_score'), r['probability'], r['segment'], r['review'], r['source']]
         writer.writerow(["'" + str(v) if isinstance(v, str) and v.startswith(('=', '+', '-', '@')) else v for v in values])
     return Response('\ufeff' + out.getvalue(), media_type='text/csv', headers={'Content-Disposition': 'attachment; filename="sprout-candidates.csv"'})
 
@@ -271,7 +279,8 @@ def detail(application_id: str):
     probability = model_predictions.get(application_id)
     return clean({'id': application_id, 'data': r, 'source': 'ML dataset', 'confirmed': True, 'status': 'completed',
                   'probability': probability, 'segment': segment(probability) if probability is not None else ('Dataset Shortlist' if int(r['Shortlisted']) else 'Dataset Pool'),
-                  'review': state['reviews'].get(application_id, 'Pending'), 'warnings': [], 'job_id': r['Job ID']})
+                  'review': state['reviews'].get(application_id, 'Pending'), 'warnings': [], 'job_id': r['Job ID'],
+                  'recruitment_score': model_recruitment_scores.get(application_id) if probability is not None else None})
 
 
 class ReviewInput(BaseModel):
@@ -291,18 +300,30 @@ def review_candidate(application_id: str, payload: ReviewInput):
 
 def update_screening(screening_id, **changes):
     with LOCK:
+        if 'status' in changes:
+            history=state['screenings'][screening_id].setdefault('stage_history', [])
+            if changes['status'] not in history:
+                history.append(changes['status'])
         state['screenings'][screening_id].update(changes)
         persist()
 
 
 def extract_resume(screening_id):
+    # Multiple uploaded documents keep independent statuses; limit heavy OCR/model parsers.
+    with EXTRACTION_SLOTS:
+        _extract_resume(screening_id)
+
+
+def _extract_resume(screening_id):
     global ocr_engine
     try:
         path = UPLOADS / (screening_id + '.pdf')
         update_screening(screening_id, status='extracting_text')
         texts, methods, warnings = [], [], []
         with fitz.open(path) as doc:
+            update_screening(screening_id, total_pages=len(doc))
             for i, page in enumerate(doc):
+                update_screening(screening_id, status='extracting_text', page=i+1)
                 text = page.get_text(sort=True)
                 if len(re.sub(r'\s', '', text)) < 40:
                     update_screening(screening_id, status='ocr', page=i + 1)
@@ -326,9 +347,21 @@ def extract_resume(screening_id):
             raise ValueError('No readable text was found. Please use a clearer PDF.')
         update_screening(screening_id, status='parsing')
         data = parse_resume(text)
+        parser_metadata = {'parser': 'local', 'parser_model': None, 'evidence': {}}
+        if parser_status()['gemini_configured']:
+            try:
+                update_screening(screening_id, status='structuring')
+                result = extract_with_gemini(text)
+                data = result['data']
+                warnings.extend(result['warnings'])
+                parser_metadata = {key: result[key] for key in ('parser', 'parser_model', 'evidence')}
+            except GeminiError as exc:
+                warnings.append(str(exc) + ' Local parsing was used instead; review all fields.')
         warnings.append('Extraction is a draft. Confirm grades, backlog information, and section entries before prediction.')
+        update_screening(screening_id, status='checking_fields')
+        validation_issues = validate_confirmed(dict(data))
         update_screening(screening_id, status='ready', data=data, text=text, extraction_methods=methods,
-                         warnings=warnings, segment='Needs Data Review', error=None)
+                         warnings=warnings, validation_issues=validation_issues, segment='Needs Data Review', error=None, **parser_metadata)
     except Exception as exc:
         logging.exception('Resume extraction failed')
         message = str(exc) if isinstance(exc, ValueError) else 'Resume extraction failed. Check OCR dependencies and try again.'
@@ -365,14 +398,20 @@ def parse_resume(text):
                    'internships': 'Internships', 'internship experience': 'Internships', 'certifications': 'Certifications',
                    'certificates': 'Certifications', 'achievements': 'Achievements', 'awards': 'Achievements'}
     current = None
+    explicitly_empty = set()
     for line in lines:
+        if re.search(r'FICTIONAL TEST RESUME|Not a real applicant|Incepta prototype', line, re.I) or line.isdigit():
+            continue
         heading = re.sub(r'[^a-z ]', '', line.casefold()).strip()
         if heading in heading_map:
             current = heading_map[heading]
         elif heading in ['education', 'skills', 'technical skills', 'experience', 'work experience', 'summary', 'contact', 'interests']:
             current = None
         elif current and len(line) < 150:
-            sections[current].append(re.sub(r'^[•\-*\d.)\s]+', '', line))
+            if re.fullmatch(r'none(?:\s*[-–:]\s*explicitly declared by candidate)?', line, re.I):
+                explicitly_empty.add(current)
+            else:
+                sections[current].append(re.sub(r'^[•\-*\d.)\s]+', '', line))
     data = {'Full Name': name, 'Email': search(r'([\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,})'),
             'Degree': degree, 'Specialization': specialization, 'CGPA': float(cgpa) if cgpa else None,
             'Class 10 Percentage': school_percentage(r'(?:Class\s*(?:10|X)\b|10th\b|SSC\b)'),
@@ -380,7 +419,7 @@ def parse_resume(text):
             'Backlogs': int(backlogs) if backlogs is not None else None,
             'Skills': found_skills or None}
     for key, entries in sections.items():
-        data[key] = list(dict.fromkeys(entries)) or None
+        data[key] = list(dict.fromkeys(entries)) if entries else ([] if key in explicitly_empty else None)
         # Draft section lines may include descriptions. Counts require explicit HR confirmation.
     return data
 
@@ -488,35 +527,82 @@ def confirm_data(screening_id: str, payload: DataInput):
     return get_screening(screening_id)
 
 
-def raw_record(s):
-    d = s['data']
+def raw_record(s, data=None):
+    d = s['data'] if data is None else data
     job = find_job(s['job_id'])
     r = {'Application ID': s['id'], 'Candidate ID': s['candidate_id'], 'Job ID': job['id'], 'Job Role': job['title'],
-         'Degree': d['Degree'], 'Specialization': d['Specialization'], **{k: d[k] for k in NUMERIC_FIELDS},
+         'Degree': d.get('Degree'), 'Specialization': d.get('Specialization'), **{k: d.get(k) for k in NUMERIC_FIELDS},
          'Number of Openings': job['openings'], 'Required Skills': ', '.join(job['required_skills']),
          'Preferred Degree': ', '.join(job['preferred_degree']), 'Minimum CGPA': job['minimum_cgpa']}
     for key in LIST_FIELDS:
-        entries = split_list(d[key])
-        r[key] = ', '.join(entries) if entries else 'None'
+        entries = split_list(d.get(key))
+        r[key] = (', '.join(entries) if entries else 'None') if d.get(key) is not None else None
         if key != 'Skills':
-            r['Number of ' + key] = len(entries)
+            r['Number of ' + key] = len(entries) if d.get(key) is not None else None
     return r
 
 
-def make_features(r):
-    r = dict(r)
-    r['CGPA_Score'] = float(r['CGPA']) / 10
-    r['CGPA_Eligible'] = int(float(r['CGPA']) >= float(r['Minimum CGPA']))
-    r['CGPA_Gap'] = float(r['CGPA']) - float(r['Minimum CGPA'])
-    r['Degree_Match'] = int(r['Degree'] in str(r['Preferred Degree']).split(', '))
-    required = set(str(r['Required Skills']).split(', '))
-    r['Skill_Match'] = round(len(set(str(r['Skills']).split(', ')) & required) / len(required), 2)
-    r['Backlog_Score'] = 1 - float(r['Backlogs']) / 6
-    for name in ['Project', 'Internship', 'Certification', 'Achievement']:
-        count = float(r['Number of ' + name + 's'])
-        r[name + '_Count'] = count
-        r[name + '_Score'] = count / normalizers[name + '_Count']
-    return r
+class ScreeningExport(BaseModel):
+    screening_ids: list[str] = Field(min_length=1, max_length=100)
+    mode: str = 'model'
+
+
+@app.post('/api/screenings/export-csv')
+def export_screenings(payload: ScreeningExport):
+    if payload.mode not in ('model', 'draft'):
+        raise HTTPException(422, 'Export mode must be model or draft.')
+    if len(payload.screening_ids) != len(set(payload.screening_ids)):
+        raise HTTPException(422, 'Each application must be selected only once.')
+    records = []
+    for screening_id in payload.screening_ids:
+        s = get_screening(screening_id)
+        if s['status'] not in ('ready', 'completed'):
+            raise HTTPException(409, 'Wait for extraction to finish; failed documents cannot be exported.')
+        if payload.mode == 'model' and not s.get('confirmed'):
+            raise HTTPException(409, 'Review and confirm every selected resume before downloading model-ready data.')
+        records.append(raw_record(s))
+    if payload.mode == 'model':
+        from backend.pipeline.validation import validate_records
+        valid, errors = validate_records(records)
+        if errors:
+            raise HTTPException(422, {'message':'Some application fields need review.', 'fields':[row['Errors'] for row in errors]})
+        records = valid
+    stream = io.StringIO(newline='')
+    writer = csv.DictWriter(stream, fieldnames=RAW_COLUMNS, extrasaction='ignore')
+    writer.writeheader()
+    writer.writerows(records)
+    filename = 'Incepta_Applications.csv' if payload.mode == 'model' else 'Incepta_Extraction_Draft.csv'
+    return Response('\ufeff' + stream.getvalue(), media_type='text/csv',
+                    headers={'Content-Disposition':f'attachment; filename="{filename}"',
+                             'X-CSV-Status':'model-ready' if payload.mode == 'model' else 'draft-needs-review'})
+
+
+def model_mapping(s, data=None):
+    if not artifact:
+        raise HTTPException(503, model_error or 'Model unavailable.')
+    record = raw_record(s, data)
+    from backend.pipeline.validation import validate_records
+    valid, invalid = validate_records([record])
+    if invalid:
+        raise HTTPException(422, invalid[0]['Errors'])
+    features = make_features(valid[0])
+    return {'raw_record': clean({key: valid[0][key] for key in raw_columns}),
+            'model_inputs': clean({key: features[key] for key in artifact['feature_columns']}),
+            'feature_count': len(artifact['feature_columns']), 'normalization_constants': normalizers,
+            'model_name': artifact['model_name'], 'threshold': float(artifact['threshold']),
+            'excluded_fields': ['Full Name', 'Email', 'Application ID', 'Candidate ID', 'Job ID']}
+
+
+@app.post('/api/screenings/{screening_id}/input-preview')
+def preview_inputs(screening_id: str, payload: DataInput):
+    s = get_screening(screening_id)
+    if s['status'] not in ('ready', 'completed'):
+        raise HTTPException(409, 'Wait for extraction to finish before checking model inputs.')
+    data = dict(payload.data)
+    errors = validate_confirmed(data)
+    if errors:
+        raise HTTPException(422, {'message': 'Complete the model inputs first.', 'fields': errors})
+    return model_mapping(s, data)
 
 
 @app.post('/api/candidates/{application_id}/predict')
@@ -528,30 +614,30 @@ def predict(application_id: str):
         if not s.get('confirmed'):
             raise HTTPException(409, 'Confirm the extracted data before prediction.')
         raw = raw_record(s)
-        frame = pd.DataFrame([make_features(raw)])[artifact['feature_columns']]
     else:
         frame = dataset[dataset['Application ID'] == application_id]
         if frame.empty:
             raise HTTPException(404, 'Application not found.')
-        frame = frame[artifact['feature_columns']].copy()
         job = find_job(dataset.loc[dataset['Application ID'] == application_id, 'Job ID'].iloc[0])
         # Refresh job-dependent inputs if HR edited an opening.
         raw = dataset[dataset['Application ID'] == application_id].iloc[0].to_dict()
         raw.update({'Job Role': job['title'], 'Required Skills': ', '.join(job['required_skills']), 'Preferred Degree': ', '.join(job['preferred_degree']),
                     'Minimum CGPA': job['minimum_cgpa'], 'Number of Openings': job['openings']})
-        frame = pd.DataFrame([make_features(raw)])[artifact['feature_columns']]
     try:
-        classes = list(artifact['pipeline'].classes_)
-        probability = float(artifact['pipeline'].predict_proba(frame)[0][classes.index(1)])
+        scored, _ = recruitment_pipeline.process_records([raw])
+        pipeline_result = scored[0]
+        probability = pipeline_result['Model_Score']
     except Exception as exc:
         logging.exception('Prediction failed')
         raise HTTPException(503, 'The model could not score this record. Its segment was not changed.') from exc
     result = {'probability': probability, 'segment': segment(probability), 'threshold': float(artifact['threshold']),
-              'model_name': artifact['model_name'], 'feature_count': len(artifact['feature_columns'])}
+              'model_name': artifact['model_name'], 'feature_count': len(artifact['feature_columns']),
+              'recruitment_score': pipeline_result['Recruitment_Score'], 'pipeline_result': pipeline_result}
     if application_id in state['screenings']:
         update_screening(application_id, **result, status='completed', model_record=clean(raw))
     else:
         model_predictions[application_id] = probability
+        model_recruitment_scores[application_id] = pipeline_result['Recruitment_Score']
     return result
 
 
@@ -560,10 +646,7 @@ def mapped_data(screening_id: str):
     s = get_screening(screening_id)
     if not s['confirmed']:
         raise HTTPException(409, 'Confirm candidate data before exporting model inputs.')
-    r = make_features(raw_record(s))
-    columns = artifact['feature_columns'] if artifact else list(r)
-    return {'raw_record': clean({key: r[key] for key in raw_columns}), 'model_inputs': clean({key: r[key] for key in columns}),
-            'feature_count': len(columns), 'normalization_constants': normalizers}
+    return model_mapping(s)
 
 
 @app.post('/api/segments/run')
@@ -576,22 +659,17 @@ def segment_dataset(job_id: str = ''):
     if frame.empty:
         return {'processed': 0, 'potential_matches': 0, 'message': 'No reference dataset applications for this opening. Use resume upload to add candidates.'}
     try:
-        for j in jobs_list():
-            if j['id'] not in state['jobs']:
-                continue
-            mask = frame['Job ID'] == j['id']
-            for index, row in frame.loc[mask].iterrows():
-                raw = row.to_dict()
-                raw.update({'Job Role': j['title'], 'Required Skills': ', '.join(j['required_skills']),
-                            'Preferred Degree': ', '.join(j['preferred_degree']), 'Minimum CGPA': j['minimum_cgpa'], 'Number of Openings': j['openings']})
-                features = make_features(raw)
-                for key in artifact['feature_columns']:
-                    frame.at[index, key] = features[key]
-        positive_index = list(artifact['pipeline'].classes_).index(1)
-        probabilities = artifact['pipeline'].predict_proba(frame[artifact['feature_columns']])[:, positive_index]
+        jobs = {j['id']: j for j in jobs_list()}
+        records = frame.to_dict('records')
+        for raw in records:
+            j = jobs[raw['Job ID']]
+            raw.update({'Job Role': j['title'], 'Required Skills': ', '.join(j['required_skills']),
+                        'Preferred Degree': ', '.join(j['preferred_degree']), 'Minimum CGPA': j['minimum_cgpa'], 'Number of Openings': j['openings']})
+        scored, _ = recruitment_pipeline.process_records(records)
         with LOCK:
-            model_predictions.update(dict(zip(frame['Application ID'], (float(p) for p in probabilities))))
-        return {'processed': len(frame), 'potential_matches': int((probabilities >= float(artifact['threshold'])).sum()),
+            model_predictions.update({r['Application ID']: r['Model_Score'] for r in scored})
+            model_recruitment_scores.update({r['Application ID']: r['Recruitment_Score'] for r in scored})
+        return {'processed': len(frame), 'potential_matches': sum(r['Model_Prediction'] for r in scored),
                 'threshold': float(artifact['threshold'])}
     except Exception as exc:
         logging.exception('Dataset segmentation failed')

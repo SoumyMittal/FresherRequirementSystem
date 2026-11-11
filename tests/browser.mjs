@@ -2,13 +2,14 @@ import { chromium } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 
 const browser = await chromium.launch({channel: 'msedge', headless: true});
-const page = await browser.newPage({baseURL:'http://127.0.0.1:8000', viewport: {width: 1440, height: 1100}, deviceScaleFactor: 1, reducedMotion:'reduce'});
+const baseURL = process.env.SPROUT_TEST_URL || 'http://127.0.0.1:8000';
+const page = await browser.newPage({baseURL, viewport: {width: 1440, height: 1100}, deviceScaleFactor: 1, reducedMotion:'reduce'});
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 await mkdir('test-results', {recursive:true});
 
 try {
-  await page.goto('http://127.0.0.1:8000');
+  await page.goto(baseURL);
   await page.getByRole('heading', {name:'Welcome to Sprout.'}).waitFor();
   await page.screenshot({path:'test-results/login-desktop.png', fullPage:true});
   await page.getByRole('button', {name:'Enter demo workspace'}).click();

@@ -31,13 +31,22 @@ const paths = {
 const icon = (name, cls = '') => `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.file}</svg>`;
 const e = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const num = v => Number(v || 0).toLocaleString('en-IN');
-const pct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+const pct = v => {
+  if(v == null || !Number.isFinite(Number(v))) return '—';
+  const percent=Number(v)*100;
+  if(percent===0) return '0%';
+  if(percent>0 && percent<.001) return `${percent.toExponential(2)}%`;
+  if(percent<.1) return `${percent.toFixed(3)}%`;
+  if(percent>99.9 && percent<100) return '>99.9%';
+  return `${percent.toFixed(1)}%`;
+};
 const list = v => Array.isArray(v) ? v : (!v || ['none', 'n, o, n, e', 'nan'].includes(String(v).toLowerCase()) ? [] : String(v).split(',').map(x => x.trim()).filter(Boolean));
 const initials = v => (String(v || 'C').replace(/^CND_/, '').slice(-2)).toUpperCase();
 const brand = `<a href="#overview" class="brand" aria-label="Sprout home">${icon('sprout')}<span>sprout<span class="brand-dot">.</span></span></a>`;
 const app = document.querySelector('#app');
-let current = 'overview', summary, jobs = [], health, filters = {q: '', job_id: '', segment: '', review: '', page: 1}, selectedFile = null;
+let current = 'overview', summary, jobs = [], health, filters = {q: '', job_id: '', segment: '', review: '', page: 1};
 let viewGeneration = 0, modalGeneration = 0, toastTimer, searchTimer, pollTimer, lastFocus, controller;
+let selectedFiles = [], uploadQueue = [], uploadSending = false;
 const pageNames = {overview: 'Overview', candidates: 'Talent pool', screening: 'Resume studio', jobs: 'Open positions', reports: 'Reports'};
 
 async function api(path, options = {}) {
@@ -137,9 +146,13 @@ async function overview(generation) {
   document.querySelector('#view-pool').onclick = () => goto('candidates');
   bindCandidateButtons();
 }
+function candidateScoreCell(r) {
+  const weighted=r.recruitment_score ?? r.score;
+  return `<div class="score"><span>${weighted!=null?Number(weighted).toFixed(2):'—'}</span>${weighted!=null?`<span class="score-track"><i style="width:${Math.max(0,Math.min(100,weighted))}%"></i></span>`:''}</div><span class="sub">${r.recruitment_score!=null?'Recruitment score / 100':r.score!=null?'Dataset score / 100':'Awaiting confirmation'}</span>${r.probability!=null?`<span class="sub classifier-table-score">ML signal: ${pct(r.probability)}</span>`:''}`;
+}
 function candidateTable(rows, compact = false) {
   if (!rows.length) return empty('No candidates here yet.', 'Try a different filter, or upload a resume to begin.');
-  return `<div class="table-wrapper"><table><thead><tr><th>Candidate</th><th>Position</th>${!compact ? '<th>Skills</th>' : ''}<th>Score <span title="Dataset score is a synthetic weighted score. Model score appears only after prediction.">ⓘ</span></th><th>Segment</th>${!compact ? '<th>HR review</th>' : ''}<th><span class="sr-only">View candidate</span></th></tr></thead><tbody>${rows.map((r,i) => `<tr><td><div class="candidate-cell"><span class="avatar ${['','peach','blue','lilac'][i%4]}">${e(initials(r.name))}</span><div><strong>${e(r.name)}</strong><span class="sub">${e(r.degree || 'Degree pending')} · ${e(r.specialization || 'Details pending')}</span></div></div></td><td><strong>${e(r.job)}</strong><span class="sub">${e(r.source)}</span></td>${!compact ? `<td><div class="skills-cell">${r.skills.slice(0,2).map(s => `<span class="pill">${e(s)}</span>`).join('')}${r.skills.length > 2 ? `<span class="pill more">+${r.skills.length-2}</span>` : ''}</div></td>` : ''}<td><div class="score"><span>${r.probability != null ? pct(r.probability) : r.score != null ? Number(r.score).toFixed(1) : '—'}</span><span class="score-track"><i style="width:${Math.max(0, Math.min(100, r.probability != null ? r.probability * 100 : r.score || 0))}%"></i></span></div><span class="sub">${r.probability != null ? 'Model score' : r.score != null ? 'Dataset score' : 'Awaiting confirmation'}</span></td><td>${badge(r.segment)}</td>${!compact ? `<td>${badge(r.review)}</td>` : ''}<td><button class="icon-btn view-candidate" data-id="${e(r.id)}" aria-label="View ${e(r.name)}">${icon('arrowUp')}</button></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrapper"><table><thead><tr><th>Candidate</th><th>Position</th>${!compact ? '<th>Skills</th>' : ''}<th>Score <span title="Dataset score is a synthetic weighted score. Model score appears only after prediction.">ⓘ</span></th><th>Segment</th>${!compact ? '<th>HR review</th>' : ''}<th><span class="sr-only">View candidate</span></th></tr></thead><tbody>${rows.map((r,i) => `<tr><td><div class="candidate-cell"><span class="avatar ${['','peach','blue','lilac'][i%4]}">${e(initials(r.name))}</span><div><strong>${e(r.name)}</strong><span class="sub">${e(r.degree || 'Degree pending')} · ${e(r.specialization || 'Details pending')}</span></div></div></td><td><strong>${e(r.job)}</strong><span class="sub">${e(r.source)}</span></td>${!compact ? `<td><div class="skills-cell">${r.skills.slice(0,2).map(s => `<span class="pill">${e(s)}</span>`).join('')}${r.skills.length > 2 ? `<span class="pill more">+${r.skills.length-2}</span>` : ''}</div></td>` : ''}<td>${candidateScoreCell(r)}</td><td>${badge(r.segment)}</td>${!compact ? `<td>${badge(r.review)}</td>` : ''}<td><button class="icon-btn view-candidate" data-id="${e(r.id)}" aria-label="View ${e(r.name)}">${icon('arrowUp')}</button></td></tr>`).join('')}</tbody></table></div>`;
 }
 function bindCandidateButtons() {
   document.querySelectorAll('.view-candidate').forEach(button => button.onclick = () => openCandidate(button.dataset.id));
@@ -187,64 +200,118 @@ async function studio(generation) {
   const recent = data.items.filter(r => r.source === 'Resume upload');
   if (generation !== viewGeneration) return;
   document.querySelector('#content').innerHTML = `<div>${intro('Every resume has a story.', 'Upload it. Uncover the details. Find the fit.', '', 'RESUME STUDIO')}<div class="upload-layout"><section class="card upload-box"><div class="section-head"><div><h2>Start with a resume</h2><p>A clearer first look, in just a few steps.</p></div><span class="badge green">OCR enabled</span></div><label class="form-label" for="upload-job">Screen for a position</label><select class="input" id="upload-job">${jobOptions(filters.job_id, false)}</select><label class="dropzone" id="dropzone"><input id="resume-file" type="file" accept="application/pdf,.pdf" aria-label="Choose a PDF resume"><span class="upload-symbol">${icon('upload')}</span><h3>Drop a resume here</h3><p>or <span class="browse">browse your files</span> to get started</p><span class="file-limit">PDF ONLY &nbsp; · &nbsp; UP TO 10 MB &nbsp; · &nbsp; 15 PAGES MAX</span></label><div id="selected-file"></div><div class="upload-action"><p>Scanned PDF? We’ll use OCR to read the text for you.</p><button class="btn primary" id="screen-button">Extract resume ${icon('arrow')}</button></div><div id="upload-progress"></div></section><aside class="card how-card"><div class="eyebrow muted" style="font-size:9px;margin-bottom:10px">FROM RESUME TO CLARITY</div><h2>A simple, thoughtful flow.</h2>${[['1','Extract the details','Text extraction and OCR turn your PDF into an editable candidate profile.'],['2','Give it a human check','Review the original, correct the fields, and confirm what’s accurate.'],['3','Discover the fit','The saved model compares the confirmed profile with your selected opening.']].map(([n,title,sub]) => `<div class="how-step"><span class="step-num">${n}</span><div><h4>${title}</h4><p>${sub}</p></div></div>`).join('')}<div style="margin-top:27px">${notice('Missing details stay unknown. We never assume a grade or a backlog count.')}</div></aside></div><section class="card" style="margin-top:24px"><div class="card-head between"><div><h2>Ready for a closer look</h2><p class="small muted" style="font-size:10px;margin-top:5px">Uploaded resumes waiting for data review</p></div><button class="text-btn" id="upload-history">View history ${icon('arrow')}</button></div>${candidateTable(recent.slice(0,6), true)}</section>${footer()}</div>`;
-  selectedFile = null;
   const input = document.querySelector('#resume-file');
-  input.onchange = () => selectFile(input.files[0]);
+  input.multiple = true;
+  input.setAttribute('aria-label', 'Choose PDF resumes');
+  document.querySelector('.upload-box h2').textContent = 'Start with your resumes';
+  document.querySelector('.dropzone h3').textContent = 'Drop one or more resumes here';
+  document.querySelector('.file-limit').textContent = 'PDF ONLY · UP TO 10 FILES · 10 MB / FILE · 15 PAGES / FILE';
+  input.onchange = () => { selectFiles(input.files); input.value = ''; };
   const drop = document.querySelector('#dropzone');
   ['dragenter','dragover'].forEach(type => drop.addEventListener(type, ev => {ev.preventDefault(); drop.classList.add('dragover');}));
   ['dragleave','drop'].forEach(type => drop.addEventListener(type, ev => {ev.preventDefault(); drop.classList.remove('dragover');}));
-  drop.addEventListener('drop', ev => { if(ev.dataTransfer.files.length) selectFile(ev.dataTransfer.files[0]); });
+  drop.addEventListener('drop', ev => selectFiles(ev.dataTransfer.files));
   document.querySelector('#screen-button').onclick = beginUpload;
+  if(health.gemini_configured) document.querySelector('#upload-progress').insertAdjacentHTML('beforebegin', `<div style="margin-top:18px">${notice('Gemini-assisted parsing is enabled. Extracted resume text is sent to Google for structuring; HR must review and confirm the result.')}</div>`);
   document.querySelector('#upload-history').onclick = () => { filters.segment = ''; filters.q = 'RES_'; filters.page = 1; goto('candidates'); };
   bindCandidateButtons();
+  renderSelectedFiles();
+  renderUploadQueue();
+  if(uploadQueue.some(item => item.id && !['ready','completed','failed'].includes(item.status))) pollUploadQueue(generation);
 }
-function selectFile(file) {
-  if (!file) return;
-  if (!file.name.toLowerCase().endsWith('.pdf')) return toast('Please choose a PDF resume.', true);
-  if (file.size > 10*1024*1024) return toast('Please choose a file smaller than 10 MB.', true);
-  selectedFile = file;
-  document.querySelector('#selected-file').innerHTML = `<div class="upload-filename">${icon('file')}<div><strong>${e(file.name)}</strong><small>${(file.size/1024).toFixed(0)} KB · Ready to extract</small></div><button class="icon-btn" id="remove-file" aria-label="Remove selected file">${icon('x')}</button></div>`;
-  document.querySelector('#remove-file').onclick = () => { selectedFile = null; document.querySelector('#resume-file').value = ''; document.querySelector('#selected-file').innerHTML = ''; };
+function selectFiles(files) {
+  const errors = [];
+  for(const file of files) {
+    if(!file.name.toLowerCase().endsWith('.pdf')) {errors.push(`${file.name}: choose a PDF.`); continue;}
+    if(file.size > 10*1024*1024) {errors.push(`${file.name}: exceeds 10 MB.`); continue;}
+    if(selectedFiles.some(f => f.name === file.name && f.size === file.size && f.lastModified === file.lastModified)) continue;
+    if(selectedFiles.length >= 10) {errors.push('Select at most 10 files per upload.'); break;}
+    selectedFiles.push(file);
+  }
+  renderSelectedFiles();
+  if(errors.length) toast(errors.join(' '), true);
+}
+function renderSelectedFiles() {
+  const target = document.querySelector('#selected-file');
+  if(!target) return;
+  target.innerHTML = selectedFiles.map((file,index) => `<div class="upload-filename">${icon('file')}<div><strong>${e(file.name)}</strong><small>${(file.size/1024).toFixed(0)} KB · Ready to extract</small></div><button class="icon-btn remove-file" data-index="${index}" aria-label="Remove ${e(file.name)}">${icon('x')}</button></div>`).join('');
+  target.querySelectorAll('.remove-file').forEach(button => button.onclick = () => {selectedFiles.splice(Number(button.dataset.index),1); renderSelectedFiles();});
+  const button = document.querySelector('#screen-button');
+  button.disabled = uploadSending;
+  button.innerHTML = (selectedFiles.length > 1 ? `Extract ${selectedFiles.length} resumes` : 'Extract resume') + icon('arrow');
+  document.querySelector('#upload-job').disabled = uploadSending;
 }
 async function beginUpload() {
   const job = document.querySelector('#upload-job').value;
   if (!job) return toast('Choose a position first.', true);
-  if (!selectedFile) return toast('Choose a PDF resume to get started.', true);
-  const button = document.querySelector('#screen-button');
-  button.disabled = true;
-  const data = new FormData(); data.append('file', selectedFile);
-  const generation = viewGeneration;
-  try {
-    document.querySelector('#upload-progress').innerHTML = `<div class="progress-card"><div class="spinner"></div><h3>Uploading your resume…</h3><p>We’ll show the extracted details for your review.</p></div>`;
-    const result = await api('/screenings?job_id=' + encodeURIComponent(job), {method:'POST',body:data});
-    if (generation === viewGeneration) pollScreening(result.id, generation);
-    else toast('Resume uploaded. Find it in the talent pool when ready.');
-  } catch (err) {
-    if (generation === viewGeneration) { document.querySelector('#upload-progress').innerHTML = notice(e(err.message), 'error'); button.disabled = false; }
-    toast(err.message, true);
+  if (!selectedFiles.length) return toast('Choose a PDF resume to get started.', true);
+  if(uploadSending) return;
+  const files = selectedFiles.splice(0);
+  const entries = files.map(file => ({file, name:file.name, job_id:job, job_title:jobs.find(j=>j.id===job)?.title, status:'uploading', id:null}));
+  uploadQueue.push(...entries);
+  uploadSending = true;
+  renderSelectedFiles(); renderUploadQueue();
+  for(const entry of entries) {
+    const data = new FormData(); data.append('file', entry.file);
+    try {
+      const result = await api('/screenings?job_id=' + encodeURIComponent(job), {method:'POST',body:data});
+      entry.id = result.id; entry.status = 'queued';
+    } catch(err) {entry.status = 'failed'; entry.error = err.message;}
+    if(current === 'screening') renderUploadQueue();
   }
+  uploadSending = false;
+  if(current === 'screening') {renderSelectedFiles(); pollUploadQueue(viewGeneration);}
+  else toast('Resumes uploaded. Open Resume studio or the talent pool to review them.');
 }
-async function pollScreening(id, generation) {
+function renderUploadQueue() {
+  const target = document.querySelector('#upload-progress');
+  if(!target || !uploadQueue.length) return;
+  document.querySelector('.upload-layout')?.classList.add('processing-mode');
+  const ready=uploadQueue.filter(entry=>['ready','completed'].includes(entry.status));
+  const confirmed=ready.filter(entry=>entry.confirmed);
+  const failed=uploadQueue.filter(entry=>entry.status==='failed');
+  const active=uploadQueue.find(entry=>!['ready','completed','failed','queued','uploading'].includes(entry.status)) || uploadQueue.find(entry=>!['ready','completed','failed'].includes(entry.status));
+  const steps={uploading:['Gathering…','Bringing your documents into the workspace.'],queued:['Making room…','Your file is waiting for an extraction slot.'],extracting_text:['Reading…','Finding the words, page by page.'],ocr:['Bringing it into focus…','Reading text from scanned pages with OCR.'],parsing:['Structuring…','Organizing education, skills, and experience.'],structuring:['Connecting the dots…','Gemini is grouping the resume into evidence-backed fields.'],checking_fields:['Checking the details…','Preparing the extracted fields for your review.']};
+  const [word,description]=active?(steps[active.status]||steps.queued):[failed.length?'A little attention needed.':confirmed.length===ready.length?'Ready for what’s next.':'The pieces are in place.','Extraction is finished. Review each profile before preparing the model-ready CSV.'];
+  const labels={...Object.fromEntries(Object.entries(steps).map(([key,value])=>[key,value[0].replace('…','')])),ready:'Ready for review',completed:'Model result ready',failed:'Needs attention'};
+  target.innerHTML = `<section class="processing-studio" aria-label="Resume processing"><header class="processing-heading"><span class="eyebrow">THE RESUME WORKSHOP</span><button class="text-btn" id="add-more-resumes">${icon('plus')} Add more resumes</button></header><div class="processing-hero ${active?'is-working':'is-finished'}"><div class="bloom" aria-hidden="true">${Array.from({length:8},(_,i)=>`<i style="--petal:${i}"></i>`).join('')}<b></b></div><div><h2 class="processing-word" aria-live="polite">${word}</h2><p>${description}</p>${active?`<span class="processing-current">${e(active.name)}${active.page?` · page ${active.page}${active.total_pages?' of '+active.total_pages:''}`:''}</span>`:'<span class="processing-current">Extracted facts. A human check. A clearer next step.</span>'}</div></div><div class="processing-track"><div><strong>${ready.length}</strong> of ${uploadQueue.length} extracted</div><span>${confirmed.length} confirmed${failed.length?` · ${failed.length} need attention`:''}</span><div class="processing-meter"><i style="width:${(ready.length+failed.length)/uploadQueue.length*100}%"></i></div></div><div class="workshop-steps">${[['file','Read the source','Text extraction & OCR'],['layers','Structure the profile','Candidate fields & evidence'],['eye','Your human check','Review & confirm'],['download','Prepare the handoff','23-column application CSV']].map(([glyph,title,note],index)=>`<div class="workshop-step ${index===0&&ready.length||index===1&&ready.length||index===2&&confirmed.length||index===3&&confirmed.length?'has-progress':''}">${icon(glyph)}<div><strong>${title}</strong><small>${note}</small></div></div>`).join('')}</div><div class="processing-files">${uploadQueue.map((entry,index)=>`<div class="queue-item processing-file" data-queue-index="${index}"><div class="queue-file"><span class="document-mark ${entry.status==='failed'?'document-error':''}">${icon(entry.status==='failed'?'info':entry.confirmed?'checkCircle':'file')}</span><div><strong>${e(entry.name)}</strong><small>${e(entry.job_title)} · ${e(labels[entry.status] || entry.status)}</small>${entry.error||entry.pollError?`<p class="queue-error">${e(entry.error||'Could not refresh this file. Reconnecting…')}</p>`:''}</div></div>${['ready','completed'].includes(entry.status)?`<button class="btn tiny queue-review" data-index="${index}">${entry.status==='completed'?'View result':entry.confirmed?'View profile':'Review data'} ${icon('arrow')}</button>`:entry.status==='failed'?`<button class="btn tiny queue-retry" data-index="${index}">Retry</button>`:`<span class="working-dots" aria-label="${e(labels[entry.status])}"><i></i><i></i><i></i></span>`}</div>`).join('')}</div><section class="csv-handoff"><div>${icon('download')}<h3>Your bridge to the ML pipeline</h3><p>Download the exact 23-column application schema. The shared pipeline performs missing-value validation, feature engineering, and saved-model inference.</p><span class="handoff-note">${confirmed.length?`${confirmed.length} confirmed profile${confirmed.length===1?'':'s'} ready for the model-ready download.`:'Review and confirm complete profiles to unlock the model-ready CSV.'}</span></div><div class="handoff-actions"><button class="btn primary" id="download-model-csv" ${!confirmed.length?'disabled':''}>${icon('download')} Download ML input CSV${confirmed.length?' · '+confirmed.length:''}</button><button class="btn" id="download-draft-csv" ${!ready.length?'disabled':''}>Download extracted draft${ready.length?' · '+ready.length:''}</button><small>Drafts may contain blanks and must be reviewed before inference. Failed or unfinished files are excluded.</small></div></section></section>`;
+  document.querySelector('#add-more-resumes').onclick=()=>{document.querySelector('.upload-layout').classList.toggle('show-upload');document.querySelector('#dropzone').scrollIntoView({block:'center',behavior:'smooth'});};
+  document.querySelector('#download-model-csv').onclick=()=>downloadApplicationCSV(confirmed.map(entry=>entry.id),'model');
+  document.querySelector('#download-draft-csv').onclick=()=>downloadApplicationCSV(ready.map(entry=>entry.id),'draft');
+  target.querySelectorAll('.queue-review').forEach(button => button.onclick = async () => {
+    try { const s=await api('/screenings/'+uploadQueue[Number(button.dataset.index)].id); s.confirmed ? candidateModal(s) : openReview(s); }
+    catch(err){toast(err.message,true);}
+  });
+  target.querySelectorAll('.queue-retry').forEach(button => button.onclick = async () => {
+    const entry=uploadQueue[Number(button.dataset.index)];
+    entry.status='uploading'; entry.error=null; renderUploadQueue();
+    const data=new FormData(); data.append('file',entry.file);
+    try {const result=await api('/screenings?job_id='+encodeURIComponent(entry.job_id),{method:'POST',body:data});entry.id=result.id;entry.status='queued';}
+    catch(err){entry.status='failed';entry.error=err.message;}
+    if(current==='screening'){renderUploadQueue(); pollUploadQueue(viewGeneration);}
+  });
+}
+async function downloadApplicationCSV(ids,mode,trigger=null) {
+  const button=trigger || document.querySelector(mode==='model'?'#download-model-csv':'#download-draft-csv');
+  if(button)button.disabled=true;
+  try{
+    const response=await fetch('/api/screenings/export-csv',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({screening_ids:ids,mode})});
+    if(!response.ok){const error=await response.json();throw new Error(typeof error.detail==='string'?error.detail:error.detail?.fields?.join('; ')||'CSV export failed.');}
+    const url=URL.createObjectURL(await response.blob());
+    const link=document.createElement('a');link.href=url;link.download=mode==='model'?'Incepta_Applications.csv':'Incepta_Extraction_Draft.csv';document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+    toast(mode==='model'?'Model-ready application CSV downloaded.':'Draft downloaded. Review missing fields before using the ML pipeline.');
+  }catch(err){toast(err.message,true);}finally{if(button?.isConnected)button.disabled=false;}
+}
+async function pollUploadQueue(generation) {
+  clearTimeout(pollTimer);
   if (generation !== viewGeneration) return;
-  try {
-    const s = await api('/screenings/' + id);
-    if (generation !== viewGeneration) return;
-    if (s.status === 'ready' || s.status === 'completed') {
-      document.querySelector('#screen-button').disabled = false;
-      document.querySelector('#upload-progress').innerHTML = `<div style="margin-top:20px">${notice('Extraction is complete. Review the candidate details before running the model.')}</div>`;
-      toast('Resume extracted. Let’s review the details.');
-      openReview(s);
-      return;
-    }
-    if (s.status === 'failed') {
-      document.querySelector('#screen-button').disabled = false;
-      document.querySelector('#upload-progress').innerHTML = `<div style="margin-top:20px">${notice(e(s.error), 'error')}</div>`;
-      return;
-    }
-    const messages = {queued:'Getting your resume ready…',extracting_text:'Reading the PDF text…',ocr:`Reading scanned page ${s.page || 1} with OCR…`,parsing:'Organizing candidate details…'};
-    document.querySelector('#upload-progress').innerHTML = `<div class="progress-card"><div class="spinner"></div><h3>${messages[s.status] || 'Processing…'}</h3><p>Your resume is being processed locally. Scanned pages may take a little longer.</p><div class="progress-stages"><span class="active">01 Upload</span><span class="${['extracting_text','ocr','parsing'].includes(s.status) ? 'active' : ''}">02 Extract / OCR</span><span class="${s.status === 'parsing' ? 'active' : ''}">03 Structure</span></div></div>`;
-    pollTimer = setTimeout(() => pollScreening(id, generation), 1500);
-  } catch (err) { toast(err.message, true); if(generation === viewGeneration) document.querySelector('#screen-button').disabled = false; }
+  await Promise.all(uploadQueue.filter(entry=>entry.id && entry.status!=='failed').map(async entry=>{
+    try {const s=await api('/screenings/'+entry.id);entry.status=s.status;entry.confirmed=s.confirmed;entry.page=s.page;entry.total_pages=s.total_pages;entry.error=s.error;entry.pollError=null;}
+    catch(err){entry.pollError=err.message;}
+  }));
+  if(generation!==viewGeneration) return;
+  renderUploadQueue();
+  if(uploadQueue.some(entry=>entry.id && (!['ready','completed','failed'].includes(entry.status) || entry.pollError))) pollTimer=setTimeout(()=>pollUploadQueue(generation),1500);
 }
 
 function positions() {
@@ -310,13 +377,20 @@ async function openCandidate(id) {
   } catch (err) { toast(err.message, true); closeModal(); }
 }
 function candidateModal(s) {
+  const queueEntry=uploadQueue.find(entry=>entry.id===s.id);
+  if(queueEntry){queueEntry.status=s.status;queueEntry.confirmed=s.confirmed;if(current==='screening')renderUploadQueue();}
   const d = s.data, name = d['Full Name'] || d['Candidate ID'] || s.candidate_id;
   const job = jobs.find(j => j.id === s.job_id);
   const upload = s.source === 'Resume upload';
-  const result = s.probability != null ? `<div class="model-result"><div>${badge(s.segment)}<p>Threshold ${pct(health.threshold)} · ${e(health.model_name)}</p></div><span class="model-score">${(s.probability * 100).toFixed(1)}<small>%</small></span></div>` : '';
+  const weighted=s.recruitment_score ?? s.pipeline_result?.Recruitment_Score;
+  const result = s.probability != null ? `<div class="screening-scores">${weighted!=null?`<div class="model-result recruitment-result"><div><strong>Recruitment score</strong><p>Weighted skills, education, projects & experience</p></div><span class="model-score">${Number(weighted).toFixed(2)}<small> / 100</small></span></div>`:''}<div class="classifier-result"><div><strong>ML shortlist signal</strong><p>${e(health.model_name)} · Threshold ${pct(health.threshold)}</p>${badge(s.segment)}</div><div class="classifier-value" title="Raw model output: ${e(s.probability)}">${pct(s.probability)}</div></div><p class="score-explanation">The recruitment score and classifier signal are different measurements. A low shortlist signal does not mean a zero recruitment score.</p></div>` : '';
   const listBlock = (title, values) => `<div class="detail-list"><h4>${title}</h4><div class="pills">${list(values).length ? list(values).map(v => `<span class="pill">${e(v)}</span>`).join('') : '<span class="small muted">No confirmed entries</span>'}</div></div>`;
   const body = `<div class="detail-hero"><span class="avatar">${e(initials(name))}</span><div><h3>${e(name)}</h3><p>${e(job?.title || d['Job Role'])} &nbsp;·&nbsp; ${e(s.id)}</p></div></div>${!s.confirmed && upload ? notice(s.status === 'failed' ? e(s.error) : 'Extraction is still processing. Close this view and reopen it shortly.', s.status === 'failed' ? 'error' : '') : ''}<div class="between"><span class="small muted">${e(s.source)}</span>${badge(s.segment)}</div>${result}<div class="detail-grid"><div class="detail-item"><small>Degree</small><strong>${e(d.Degree || 'Unknown')}</strong></div><div class="detail-item"><small>CGPA</small><strong>${e(d.CGPA ?? 'Unknown')}<span class="small muted"> / 10</span></strong></div><div class="detail-item"><small>${upload ? 'Data confirmation' : 'Dataset score'}</small><strong>${upload ? (s.confirmed ? 'Confirmed' : 'Pending') : Number(d.Recruitment_Score).toFixed(1)}</strong></div></div>${listBlock('Skills', d.Skills)}${listBlock('Projects',d.Projects)}${listBlock('Internships',d.Internships)}${listBlock('Certifications',d.Certifications)}${listBlock('Achievements',d.Achievements)}<div style="margin-top:22px">${notice('Model results are suggestions. Review the original evidence and job requirements before recording your decision.')}</div><div class="review-decision"><label for="hr-review">HR decision</label><select class="input" id="hr-review">${['Pending','Reviewed','Shortlisted','Not progressing'].map(v => `<option ${v === s.review ? 'selected' : ''}>${v}</option>`).join('')}</select><button class="btn" id="save-review">Save decision</button></div>${upload ? `<details class="source-details"><summary>Extraction notes</summary><p style="margin-top:10px">${s.extraction_methods?.map(e).join(' · ') || ''}</p><p>${s.warnings?.map(e).join(' ') || ''}</p></details>` : ''}`;
   openModal('Potential, in perspective.', 'Review the evidence. Keep the decision human.', body, `${upload ? `<button class="btn" id="edit-data" ${!['ready','completed'].includes(s.status) ? 'disabled' : ''}>${icon('edit')} Review data</button>` : ''}<button class="btn primary" id="run-model" ${!s.confirmed || !health.model_ready ? 'disabled' : ''}>${icon('sparkle')} ${s.probability != null ? 'Run model again' : 'Run model'}</button>`, 'medium');
+  if(upload&&s.confirmed){
+    document.querySelector('.modal-footer').insertAdjacentHTML('afterbegin',`<button class="btn" id="download-profile-csv">${icon('download')} Download input CSV</button>`);
+    document.querySelector('#download-profile-csv').onclick=event=>downloadApplicationCSV([s.id],'model',event.currentTarget);
+  }
   document.querySelector('#save-review').onclick = async () => {
     const b = document.querySelector('#save-review'); b.disabled = true;
     try { await api('/candidates/'+s.id+'/review', {method:'PATCH',body:JSON.stringify({status:document.querySelector('#hr-review').value})}); toast('HR decision saved.'); if(current === 'candidates') loadPool(); }
@@ -336,22 +410,51 @@ function openReview(s) {
   const listField = (key, title) => `<div class="field full"><label for="list-${key}">${title} · one confirmed entry per line</label><textarea class="input review-list" id="list-${key}" data-key="${key}" placeholder="${key === 'Skills' ? 'Python\nSQL\nGit' : 'Review extracted entries, or confirm none'}">${e(list(d[key]).join('\n'))}</textarea>${key !== 'Skills' ? `<button type="button" class="confirm-none" data-none="${key}">Confirm no ${key.toLowerCase()}</button><span class="hint" id="none-${key}">${d[key] != null && !list(d[key]).length ? 'Confirmed: no entries.' : 'Blank stays unknown until you confirm no entries.'}</span>` : ''}</div>`;
   const body = `<div class="review-layout"><div><div class="pdf-preview"><iframe src="/api/screenings/${encodeURIComponent(s.id)}/resume#toolbar=0" title="Original uploaded resume"></iframe></div><div class="small muted" style="margin-top:10px;font-size:10px">${e(s.filename)} · <a target="_blank" rel="noopener" href="/api/screenings/${encodeURIComponent(s.id)}/resume">Open original PDF</a></div><details class="source-details"><summary>View extracted text & OCR notes</summary><p style="margin-top:10px;font-size:10px">${s.extraction_methods?.map(e).join(' · ') || ''}</p><pre>${e(s.text || '')}</pre></details></div><form class="review-form" id="review-form"><h3>${e(jobs.find(j=>j.id===s.job_id)?.title || 'Selected position')}</h3>${notice('Confirm all model inputs. Grades must use the indicated scales. Blank values remain unknown, and unknown data blocks prediction.','warning')}<div class="form-errors" id="review-errors" role="alert"></div><div class="field-grid">${field('Full Name','Full name · optional')}${field('Email','Email · optional','email')}${field('Degree','Degree · e.g. B.Tech','text','required')}${field('Specialization','Specialization','text','required')}${field('CGPA','CGPA · confirmed 10-point scale','number','min="0" max="10" step=".01" required')}${field('Backlogs','Backlogs · confirmed count','number','min="0" max="1000" step="1" required')}${field('Class 10 Percentage','Class 10 percentage','number','min="0" max="100" step=".01" required')}${field('Class 12 Percentage','Class 12 percentage','number','min="0" max="100" step=".01" required')}${listField('Skills','Skills')}${listField('Projects','Projects')}${listField('Internships','Internships')}${listField('Certifications','Certifications')}${listField('Achievements','Achievements')}</div><div class="notice" style="margin-top:20px"><span>Counts are calculated from confirmed entries. Treat each project, internship, certificate, or achievement as one entry; remove description lines incorrectly grouped by extraction.</span></div></form></div>`;
   openModal('A human check makes the difference.', 'Review extracted information against the original PDF.', body, `<button class="btn" id="save-confirm">${icon('check')} Confirm data</button><button class="btn primary" type="submit" form="review-form" id="confirm-predict">${icon('sparkle')} Confirm & run model</button>`, 'wide');
+  document.querySelector('.review-form h3').insertAdjacentHTML('afterend', `<p class="small muted" style="margin-bottom:12px">Parser: ${s.parser === 'gemini' ? 'Gemini · ' + e(s.parser_model) : 'Local parser'}</p>`);
+  if(s.warnings?.length) document.querySelector('#review-errors').insertAdjacentHTML('beforebegin', `<div class="small muted" style="margin-bottom:16px">${s.warnings.map(e).join('<br>')}</div>`);
+  if(s.parser === 'gemini' && s.evidence) document.querySelector('.review-layout>div').insertAdjacentHTML('beforeend', `<details class="source-details"><summary>Gemini source evidence</summary><pre>${e(JSON.stringify(s.evidence, null, 2))}</pre></details>`);
   const confirmedNone = new Set(['Projects','Internships','Certifications','Achievements'].filter(key => d[key] != null && !list(d[key]).length));
+  const job = s.job || jobs.find(item=>item.id===s.job_id);
+  document.querySelector('#review-form').insertAdjacentHTML('beforeend', `<section class="model-connection"><div class="between"><h3>Connected to the screening model</h3><span class="badge green">${e(health.model_name || 'Saved model')}</span></div><p class="small muted">These reviewed values and the selected job are the inputs used for prediction. Name and email are kept in the profile and are excluded from model inputs.</p><div class="model-job"><strong>${e(job?.title)} · ${e(job?.id)}</strong><p>${job?.openings} openings · Minimum CGPA ${job?.minimum_cgpa}</p><p>Required skills: ${e(job?.required_skills.join(', '))}</p><p>Preferred degree: ${e(job?.preferred_degree.join(', '))}</p></div><div id="model-counts" class="model-counts"></div><button class="btn" type="button" id="check-model-inputs">${icon('checkCircle')} Check model inputs</button><div id="model-input-preview" aria-live="polite"></div></section>`);
+  const readReviewData = () => {
+    const data={};
+    document.querySelectorAll('.review-field').forEach(input=>{data[input.dataset.key]=input.type==='number'?(input.value===''?null:Number(input.value)):input.value.trim()||null;});
+    document.querySelectorAll('.review-list').forEach(input=>{
+      const entries=[...new Set(input.value.split('\n').map(value=>value.trim()).filter(Boolean))];
+      data[input.dataset.key]=entries.length?entries:confirmedNone.has(input.dataset.key)?[]:null;
+    });
+    return data;
+  };
+  const refreshMapping = () => {
+    const data=readReviewData();
+    document.querySelector('#model-counts').innerHTML=['Projects','Internships','Certifications','Achievements'].map(key=>`<div><small>Number of ${key}</small><strong>${data[key]===null?'Unknown':data[key].length}</strong></div>`).join('');
+    document.querySelector('#model-input-preview').innerHTML='';
+  };
+  document.querySelector('#review-form').addEventListener('input',refreshMapping);
+  document.querySelector('#check-model-inputs').onclick=async()=>{
+    if(!document.querySelector('#review-form').reportValidity())return;
+    const button=document.querySelector('#check-model-inputs');button.disabled=true;
+    const data=readReviewData(), token=modalGeneration;
+    try{
+      const mapping=await api('/screenings/'+s.id+'/input-preview',{method:'POST',body:JSON.stringify({data})});
+      if(token!==modalGeneration)return;
+      if(JSON.stringify(readReviewData())!==JSON.stringify(data)){toast('Details changed. Check model inputs again.');return;}
+      document.querySelector('#model-input-preview').innerHTML=`<p class="mapping-success">${icon('checkCircle')} ${Object.keys(mapping.raw_record).length} application fields mapped to ${mapping.feature_count} model inputs.</p><details class="source-details"><summary>Exact model inputs · ${e(mapping.model_name)}</summary><div class="table-wrapper"><table><thead><tr><th>Model field</th><th>Value sent</th></tr></thead><tbody>${Object.entries(mapping.model_inputs).map(([key,value])=>`<tr><td>${e(key)}</td><td>${e(value)}</td></tr>`).join('')}</tbody></table></div></details>`;
+    }catch(err){if(token===modalGeneration)document.querySelector('#model-input-preview').innerHTML=notice(e(err.message),'error');}
+    finally{if(button.isConnected)button.disabled=false;}
+  };
+  refreshMapping();
   document.querySelectorAll('[data-none]').forEach(b => b.onclick = () => {
     const key = b.dataset.none;
     confirmedNone.add(key); document.querySelector('#list-'+key).value = '';
     document.querySelector('#none-'+key).textContent = 'Confirmed: no entries.';
+    refreshMapping();
   });
   document.querySelectorAll('.review-list').forEach(t => t.oninput = () => { if(t.value.trim()) confirmedNone.delete(t.dataset.key); });
   const confirm = async predict => {
     const form = document.querySelector('#review-form');
     if(!form.reportValidity()) return;
-    const data = {};
-    document.querySelectorAll('.review-field').forEach(i => {data[i.dataset.key] = i.type === 'number' ? (i.value === '' ? null : Number(i.value)) : i.value.trim() || null;});
-    document.querySelectorAll('.review-list').forEach(i => {
-      const entries = [...new Set(i.value.split('\n').map(v=>v.trim()).filter(Boolean))];
-      data[i.dataset.key] = entries.length ? entries : confirmedNone.has(i.dataset.key) ? [] : null;
-    });
+    const data = readReviewData();
     document.querySelector('#confirm-predict').disabled = document.querySelector('#save-confirm').disabled = true;
     try {
       await api('/screenings/'+s.id+'/data', {method:'PUT',body:JSON.stringify({data})});

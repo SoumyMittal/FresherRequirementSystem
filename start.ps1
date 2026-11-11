@@ -8,6 +8,14 @@ if (-not (Test-Path -LiteralPath $prototypePython)) {
     & $prototypePython -m pip install -r backend/requirements.txt
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
 }
+if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.env'))) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '.env.example') -Destination (Join-Path $PSScriptRoot '.env')
+}
+& $prototypePython -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('dotenv') else 1)"
+if ($LASTEXITCODE -ne 0) {
+    & $prototypePython -m pip install -r backend/requirements.txt
+    if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+}
 Write-Host "Sprout V1 is starting at http://127.0.0.1:$Port" -ForegroundColor Green
 Write-Host 'Local prototype with mocked login. Press Ctrl+C to stop.'
 & $prototypePython -m uvicorn backend.app:app --host 127.0.0.1 --port $Port

@@ -22,3 +22,11 @@ env/
 node_modules/
 test-results/
 playwright-report/
+
+# Secrets and generated pipeline exports
+.env
+.env.*
+!.env.example
+/Incepta_Scored_Applications*.csv
+/Incepta_Validation_Errors*.csv
+/tmp/

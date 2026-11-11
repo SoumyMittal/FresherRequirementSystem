@@ -1,6 +1,7 @@
 """Isolated prototype integration checks. Never write fixtures to the application runtime."""
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import pymupdf as fitz
@@ -30,6 +31,8 @@ def pdf_resume(scanned=False):
 class WorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.env = patch.dict('os.environ', {'GEMINI_API_KEY': ''})
+        cls.env.start()
         cls.temp = tempfile.TemporaryDirectory(prefix='sprout-tests-')
         module.RUNTIME = Path(cls.temp.name)
         module.UPLOADS = module.RUNTIME / 'uploads'
@@ -42,6 +45,7 @@ class WorkflowTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.context.__exit__(None, None, None)
         cls.temp.cleanup()
+        cls.env.stop()
 
     def upload(self, scanned=False):
         r = self.client.post('/api/screenings?job_id=JOB_001', files={'file': ('resume.pdf', pdf_resume(scanned), 'application/pdf')})
@@ -140,6 +144,111 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(module.STATE_FILE.exists())
         module.initialize()
         self.assertEqual(module.find_job(job_id)['status'], 'Closed')
+
+    def test_08_sample_pack_extracts_without_seeding_application_storage(self):
+        import json
+        expected = json.loads((module.ROOT/'samples/expected_results.json').read_text(encoding='utf-8'))
+        for item in expected:
+            with self.subTest(filename=item['filename']):
+                path = module.ROOT/'samples/resumes'/item['filename']
+                response = self.client.post('/api/screenings?job_id='+item['raw_record']['Job ID'],
+                                            files={'file':(path.name,path.read_bytes(),'application/pdf')})
+                self.assertEqual(response.status_code, 200, response.text)
+                screening_id = response.json()['id']
+                extracted = self.client.get('/api/screenings/'+screening_id).json()
+                self.assertEqual(extracted['status'], 'ready', extracted.get('error'))
+                self.assertFalse(extracted['confirmed'])
+                self.assertEqual(extracted['data']['CGPA'], item['raw_record']['CGPA'])
+                if item['mode'] in ('scanned','mixed'):
+                    self.assertTrue(any('OCR' in method for method in extracted['extraction_methods']))
+                if item['mode'] == 'mixed':
+                    self.assertTrue(any('embedded text' in method for method in extracted['extraction_methods']))
+                self.assertEqual(self.client.post(f'/api/candidates/{screening_id}/predict').status_code, 409)
+
+    def test_09_gemini_failure_falls_back_and_does_not_auto_confirm(self):
+        with patch.object(module, 'parser_status', return_value={'gemini_configured':True}), \
+             patch.object(module, 'extract_with_gemini', side_effect=module.GeminiError('Gemini returned HTTP 429.')):
+            screening_id = self.upload()
+        result = self.client.get('/api/screenings/'+screening_id).json()
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['parser'], 'local')
+        self.assertFalse(result['confirmed'])
+        self.assertTrue(any('429' in warning and 'Local parsing' in warning for warning in result['warnings']))
+
+    def test_10_review_mapping_matches_the_actual_classifier_input(self):
+        screening_id = self.upload()
+        data = self.client.get('/api/screenings/'+screening_id).json()['data']
+        data.update({'Class 10 Percentage':85, 'Class 12 Percentage':88, 'Projects':['Sales Data Analysis'],
+                     'Internships':[], 'Certifications':[], 'Achievements':[]})
+        preview = self.client.post(f'/api/screenings/{screening_id}/input-preview',json={'data':data})
+        self.assertEqual(preview.status_code, 200, preview.text)
+        mapping=preview.json()
+        self.assertEqual(mapping['raw_record']['Number of Projects'],1)
+        self.assertEqual(mapping['raw_record']['Job ID'],'JOB_001')
+        self.assertEqual(mapping['model_inputs']['Job Role'],'AI/ML Engineer')
+        self.assertNotIn('Full Name',mapping['model_inputs'])
+        self.assertFalse(self.client.get('/api/screenings/'+screening_id).json()['confirmed'])
+        self.assertEqual(self.client.post(f'/api/candidates/{screening_id}/predict').status_code,409)
+        self.client.put(f'/api/screenings/{screening_id}/data',json={'data':data})
+        classifier=module.artifact['pipeline']
+        with patch.object(classifier,'predict_proba',wraps=classifier.predict_proba) as call:
+            predicted=self.client.post(f'/api/candidates/{screening_id}/predict')
+        self.assertEqual(predicted.status_code,200,predicted.text)
+        actual=call.call_args.args[0]
+        self.assertEqual(list(actual.columns),module.artifact['feature_columns'])
+        self.assertEqual(actual.iloc[0].to_dict(),mapping['model_inputs'])
+        changed=dict(data,CGPA=6.5)
+        updated=self.client.post(f'/api/screenings/{screening_id}/input-preview',json={'data':changed}).json()
+        self.assertEqual(updated['model_inputs']['CGPA_Score'],.65)
+        self.assertEqual(self.client.get('/api/screenings/'+screening_id).json()['data']['CGPA'],8.4)
+
+    def test_11_export_is_a_real_pipeline_input_and_drafts_preserve_unknowns(self):
+        import csv
+        import io
+        from backend.pipeline.schema import RAW_COLUMNS
+        first=self.upload()
+        draft=self.client.post('/api/screenings/export-csv',json={'screening_ids':[first],'mode':'draft'})
+        self.assertEqual(draft.status_code,200,draft.text)
+        reader=csv.DictReader(io.StringIO(draft.content.decode('utf-8-sig')))
+        self.assertEqual(reader.fieldnames,list(RAW_COLUMNS))
+        row=next(reader)
+        self.assertEqual(row['Class 10 Percentage'],'')
+        self.assertEqual(self.client.post('/api/screenings/export-csv',json={'screening_ids':[first]}).status_code,409)
+        data=self.client.get('/api/screenings/'+first).json()['data']
+        data.update({'Class 10 Percentage':85,'Class 12 Percentage':88,'Projects':['Inventory, CSV Import'],
+                     'Internships':[],'Certifications':[],'Achievements':[]})
+        self.assertEqual(self.client.put(f'/api/screenings/{first}/data',json={'data':data}).status_code,200)
+        exported=self.client.post('/api/screenings/export-csv',json={'screening_ids':[first]})
+        self.assertEqual(exported.status_code,200,exported.text)
+        source=module.RUNTIME/'exported-input.csv'
+        source.write_bytes(exported.content)
+        output=module.RUNTIME/'exported-scored.csv'
+        result=module.recruitment_pipeline.process_csv(source,output)
+        self.assertEqual(result['successful_predictions'],1)
+        self.assertEqual(result['invalid_rows'],0)
+        self.assertEqual(self.client.post('/api/screenings/export-csv',json={'screening_ids':[first,first]}).status_code,422)
+        self.assertEqual(self.client.post('/api/screenings/export-csv',json={'screening_ids':['not-found']}).status_code,404)
+
+    def test_12_tiny_classifier_outputs_preserve_separate_recruitment_score(self):
+        import numpy as np
+        screening_id=self.upload()
+        data=self.client.get('/api/screenings/'+screening_id).json()['data']
+        data.update({'Class 10 Percentage':85,'Class 12 Percentage':88,'Projects':['Sales Data Analysis'],
+                     'Internships':[],'Certifications':[],'Achievements':[]})
+        self.client.put(f'/api/screenings/{screening_id}/data',json={'data':data})
+        probability=5.4713675199463515e-11
+        with patch.object(module.artifact['pipeline'],'predict_proba',return_value=np.array([[1-probability,probability]])):
+            result=self.client.post(f'/api/candidates/{screening_id}/predict').json()
+        self.assertEqual(result['probability'],probability)
+        self.assertGreater(result['recruitment_score'],0)
+        stored=self.client.get('/api/screenings/'+screening_id).json()
+        self.assertEqual(stored['probability'],probability)
+        self.assertEqual(stored['recruitment_score'],result['recruitment_score'])
+        listed=self.client.get('/api/candidates?q='+screening_id).json()['items'][0]
+        self.assertEqual(listed['recruitment_score'],result['recruitment_score'])
+        self.client.put(f'/api/screenings/{screening_id}/data',json={'data':dict(data,CGPA=7)})
+        listed=self.client.get('/api/candidates?q='+screening_id).json()['items'][0]
+        self.assertIsNone(listed['recruitment_score'])
 
 
 if __name__ == '__main__':
