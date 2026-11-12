@@ -30,7 +30,7 @@ from backend.pipeline.config import MAXIMA
 from backend.pipeline.schema import RAW_COLUMNS
 from backend.pipeline.feature_engineering import make_features
 from backend.gemini_parser import extract_with_gemini, parser_status, GeminiError
-from backend.resume_sections import extract_sections
+from backend.resume_sections import extract_sections, reconcile_and_deduplicate, derive_counts
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / '.runtime'
@@ -348,18 +348,28 @@ def _extract_resume(screening_id):
         data = parse_resume(text)
         _, grouped = extract_sections(text)
         parser_metadata = {'parser': 'local', 'parser_model': None, 'evidence': grouped}
+        gemini_result = None
         if parser_status()['gemini_configured']:
             try:
                 update_screening(screening_id, status='structuring')
-                result = extract_with_gemini(text)
-                data = {key:result['data'].get(key) if result['data'].get(key) is not None else value for key,value in data.items()}
-                warnings.extend(result['warnings'])
-                parser_metadata = {key: result[key] for key in ('parser', 'parser_model', 'evidence')}
-                parser_metadata['evidence']={**grouped,**result['evidence']}
+                gemini_result = extract_with_gemini(text)
+                for key in ['Full Name', 'Email', 'Degree', 'Specialization', 'CGPA', 'Class 10 Percentage', 'Class 12 Percentage', 'Backlogs', 'Skills']:
+                    if gemini_result['data'].get(key) is not None:
+                        data[key] = gemini_result['data'][key]
+                warnings.extend(gemini_result['warnings'])
+                parser_metadata['parser'] = gemini_result['parser']
+                parser_metadata['parser_model'] = gemini_result['parser_model']
             except GeminiError as exc:
                 warnings.append(str(exc) + ' Local parsing was used instead; review all fields.')
-        for section in ('Projects','Internships','Certifications','Achievements'):
-            data['Number of '+section]=len(data[section]) if data.get(section) is not None else None
+
+        # Reconcile, classify, and deduplicate local and Gemini entries deterministically
+        gemini_entries = gemini_result.get('canonical_entries') or gemini_result.get('evidence') if gemini_result else None
+        reconciled_values, reconciled_evidence = reconcile_and_deduplicate(grouped, gemini_entries, text)
+        for section in ('Projects', 'Internships', 'Certifications', 'Achievements'):
+            data[section] = reconciled_values.get(section)
+            data['Number of ' + section] = len(reconciled_values[section]) if reconciled_values.get(section) is not None else None
+
+        parser_metadata['evidence'] = reconciled_evidence
         warnings.append('Extraction is a draft. Missing details are Not provided; validation runs before model processing.')
         update_screening(screening_id, status='checking_fields')
         validation_issues = validate_confirmed(dict(data))
@@ -530,7 +540,10 @@ def raw_record(s, data=None):
          'Number of Openings': job['openings'], 'Required Skills': ', '.join(job['required_skills']),
          'Preferred Degree': ', '.join(job['preferred_degree']), 'Minimum CGPA': job['minimum_cgpa']}
     for key in LIST_FIELDS:
-        entries = split_list(d.get(key))
+        if isinstance(d.get(key), list):
+            entries = [str(s).strip() for s in d.get(key) if str(s).strip()]
+        else:
+            entries = split_list(d.get(key))
         r[key] = (', '.join(entries) if entries else 'None') if d.get(key) is not None else None
         if key != 'Skills':
             r['Number of ' + key] = len(entries) if d.get(key) is not None else None
