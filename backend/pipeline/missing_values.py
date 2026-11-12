@@ -39,3 +39,43 @@ def recover_candidate_fields(records):
                 recovered.append(field)
         row['Processing_Warnings'] = 'Recovered from same-candidate record: ' + ', '.join(recovered) if recovered else ''
     return result
+
+
+def prepare_model_record(record, reference):
+    """Notebook 03 fallbacks on a copy; never overwrite extracted evidence.
+
+    Reference rows supply stable medians/modes rather than upload-batch statistics.
+    """
+    from statistics import median
+    from collections import Counter
+
+    result = dict(record)
+    filled = {}
+    for field in PROFILE_FIELDS:
+        if not missing(result.get(field)):
+            continue
+        values = [row.get(field) for row in reference if not missing(row.get(field))]
+        if field in NUMERIC_BOUNDS:
+            lo, hi, integer = NUMERIC_BOUNDS[field]
+            numbers = []
+            for value in values:
+                try:
+                    number = float(value)
+                    if math.isfinite(number) and number >= lo and (hi is None or number <= hi):
+                        numbers.append(number)
+                except (TypeError, ValueError):
+                    pass
+            if not numbers:
+                continue
+            value = median(numbers)
+            # Counts must stay integral even when the median falls between integers.
+            result[field] = int(math.floor(value + .5)) if integer else value
+            rule = 'reference median'
+        elif field == 'Specialization' and values:
+            result[field] = Counter(str(v).strip() for v in values).most_common(1)[0][0]
+            rule = 'reference mode'
+        else:
+            result[field] = 'Not Provided'
+            rule = 'missing text marker'
+        filled[field] = {'value': result[field], 'method': rule}
+    return result, filled

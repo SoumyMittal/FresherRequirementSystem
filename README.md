@@ -1,4 +1,4 @@
-# Sprout · AI Fresher Recruitment V1
+# Sprout Â· AI Fresher Recruitment V1
 
 A local recruitment prototype with a polished HR workspace, mocked login, real resume extraction/OCR, confirmed candidate data, and saved-model segmentation.
 
@@ -10,7 +10,7 @@ Uses **AI_Fresher_Recruitment_ML_Dataset.csv** and **fresher_recruitment_model.j
 
 Open **http://127.0.0.1:8000** and enter the demo workspace with any email/password. Python 3.12 is required; first-run setup installs Python dependencies. The app does not require Node or a frontend build to run.
 
-**Flow:** select a position → upload PDF → extract text / OCR → review and confirm data → predict segment → record an HR decision.
+**Flow:** select a position â†’ upload PDF â†’ extract text / OCR â†’ review and confirm data â†’ predict segment â†’ record an HR decision.
 
 The talent pool supports search, filters, batch segmentation of CSV applications, and export. Open positions support creation and editing. Uploaded resumes, local edits, and HR decisions persist in ignored `.runtime` files. This is a local prototype with mocked authentication, not a public deployment.
 

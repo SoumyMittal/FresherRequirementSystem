@@ -113,3 +113,22 @@ The reported application had a genuine classifier output near `5.47e-11`, displa
 Candidate lists and summary exports retain recruitment and classifier scores separately. Dataset predictions cache their newly computed weighted score alongside their classifier output, rather than confusing it with the historical noisy dataset score. Invalidated uploads do not show a stale recruitment score. This does not recalibrate/retrain the synthetic shortlist model or promise that example resumes meet its threshold.
 
 All 27 backend tests pass, including preservation of a tiny nonzero classifier output, a separate positive recruitment score, and clearing displayed scores after data changes. The browser regression verifies that uploaded profiles show a recruitment score independently of the model signal.
+
+## Incepta: section grouping, optional fields and validation
+
+The application now uses the Incepta name. `backend/resume_sections.py` recognizes section aliases (Projects, Academic Projects, Experience, Work Experience, Internship Experience, Awards/Achievements, and Certifications). Entries retain a title, description, source text, source line and section. Description/action bullets and date/company continuation lines attach to the preceding entry instead of inflating counts. Intern/trainee roles found under Experience populate Internships; other employment is retained separately in the evidence/review view and is not falsely counted as an internship. Ambiguous layouts still need review; Gemini parsing remains optional, with local evidence preserved when Gemini omits a locally found field.
+
+School percentages support Class X/XII, 10th/12th, SSC/SSLC/HSC and common higher-secondary labels with intervening school/board/year text. An explicitly stated “no active backlogs” is zero; absent backlog information is unknown. Counts are generated from grouped entry lists, never description-line counts. Unknown sections remain null; explicit declarations of no entries remain empty lists.
+
+Blank review fields display **Not provided** and are no longer HTML-required. “Confirm no entries” controls were removed. Save review accepts incomplete records without guessing values. The separate validation layer reports missing/invalid model fields; only validated records can enter model inference or the model-ready CSV. Draft CSVs remain available with blank unknown values. Saving a review does not assert that it is model-ready. No historical training medians/modes or artificial zeros are applied to live profiles.
+
+Removed the application's fixed upload size, PDF page, selected-file count, export row count and Gemini text-length caps. PDF format/readability checks remain. Actual machine memory, OCR speed and external-provider context/time limits still apply; processing concurrency remains bounded to protect responsiveness. Documents are not truncated to satisfy an arbitrary character/page count.
+
+Verification: 33 backend tests pass, including grouped descriptions, experience aliases, long titles/many projects, incomplete saves with strict model admission, and 17-page extraction. Desktop/mobile browser suites pass, including no empty-section controls, Not provided placeholders, incomplete saves, validation-disabled inference and selecting 12 files. Tests use isolated runtime storage, not application records. No database changes or original notebook/model edits are part of this update.
+
+
+### Latest preview and CSV handoff
+
+The resume screen is now a read-only preview with empty missing fields, no confirmation controls and a Run model button. Before model CSV creation and inference, notebook 03 style handling is applied on a copy: numeric reference medians (integer counts rounded), reference specialization mode, and Not Provided for missing text. Extracted evidence and draft CSV blanks remain unchanged. The preview lists the filled fields and their methods. Invalid known values still fail validation. Model exports no longer require a separate confirmation step. The trained artifact and reference dataset are unchanged.
+
+Verification for this final behavior: 33 backend regression tests plus two missing-value preparation tests passed; JavaScript syntax checks passed. Browser checkpoint assertions were updated for the read-only preview and automatic preparation.

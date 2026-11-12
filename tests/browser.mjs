@@ -10,7 +10,7 @@ await mkdir('test-results', {recursive:true});
 
 try {
   await page.goto(baseURL);
-  await page.getByRole('heading', {name:'Welcome to Sprout.'}).waitFor();
+  await page.getByRole('heading', {name:'Welcome to Incepta.'}).waitFor();
   await page.screenshot({path:'test-results/login-desktop.png', fullPage:true});
   await page.getByRole('button', {name:'Enter demo workspace'}).click();
   await page.getByRole('heading', {name:'A fresh start. A better fit.'}).waitFor();

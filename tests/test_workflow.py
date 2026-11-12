@@ -88,7 +88,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(extracted['status'], 'ready', extracted)
         self.assertEqual(extracted['data']['CGPA'], 8.4)
         self.assertIsNone(extracted['data']['Class 10 Percentage'])
-        self.assertEqual(self.client.post(f'/api/candidates/{screening_id}/predict').status_code, 409)
+        self.assertEqual(self.client.post(f'/api/candidates/{screening_id}/predict').status_code, 200)
         data = extracted['data']
         missing = self.client.put(f'/api/screenings/{screening_id}/data', json={'data': data})
         self.assertEqual(missing.status_code, 422)
@@ -163,7 +163,7 @@ class WorkflowTests(unittest.TestCase):
                     self.assertTrue(any('OCR' in method for method in extracted['extraction_methods']))
                 if item['mode'] == 'mixed':
                     self.assertTrue(any('embedded text' in method for method in extracted['extraction_methods']))
-                self.assertEqual(self.client.post(f'/api/candidates/{screening_id}/predict').status_code, 409)
+                self.assertEqual(self.client.post(f'/api/candidates/{screening_id}/predict').status_code, 200)
 
     def test_09_gemini_failure_falls_back_and_does_not_auto_confirm(self):
         with patch.object(module, 'parser_status', return_value={'gemini_configured':True}), \
@@ -188,7 +188,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(mapping['model_inputs']['Job Role'],'AI/ML Engineer')
         self.assertNotIn('Full Name',mapping['model_inputs'])
         self.assertFalse(self.client.get('/api/screenings/'+screening_id).json()['confirmed'])
-        self.assertEqual(self.client.post(f'/api/candidates/{screening_id}/predict').status_code,409)
+        self.assertEqual(self.client.post(f'/api/candidates/{screening_id}/predict').status_code,200)
         self.client.put(f'/api/screenings/{screening_id}/data',json={'data':data})
         classifier=module.artifact['pipeline']
         with patch.object(classifier,'predict_proba',wraps=classifier.predict_proba) as call:
@@ -213,7 +213,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(reader.fieldnames,list(RAW_COLUMNS))
         row=next(reader)
         self.assertEqual(row['Class 10 Percentage'],'')
-        self.assertEqual(self.client.post('/api/screenings/export-csv',json={'screening_ids':[first]}).status_code,409)
+        self.assertEqual(self.client.post('/api/screenings/export-csv',json={'screening_ids':[first]}).status_code,200)
         data=self.client.get('/api/screenings/'+first).json()['data']
         data.update({'Class 10 Percentage':85,'Class 12 Percentage':88,'Projects':['Inventory, CSV Import'],
                      'Internships':[],'Certifications':[],'Achievements':[]})
@@ -249,6 +249,34 @@ class WorkflowTests(unittest.TestCase):
         self.client.put(f'/api/screenings/{screening_id}/data',json={'data':dict(data,CGPA=7)})
         listed=self.client.get('/api/candidates?q='+screening_id).json()['items'][0]
         self.assertIsNone(listed['recruitment_score'])
+
+    def test_13_missing_values_are_handled_before_export_and_prediction(self):
+        screening_id=self.upload()
+        data=self.client.get('/api/screenings/'+screening_id).json()['data']
+        data.update({'Backlogs':'Not provided','Class 10 Percentage':None,'Class 12 Percentage':None,
+                     'Internships':None,'Achievements':None})
+        saved=self.client.put(f'/api/screenings/{screening_id}/data',json={'data':data,'allow_incomplete':True})
+        self.assertEqual(saved.status_code,200,saved.text)
+        self.assertTrue(saved.json()['confirmed'])
+        self.assertTrue(saved.json()['model_ready'])
+        self.assertIsNone(saved.json()['data']['Backlogs'])
+        self.assertFalse(saved.json()['validation_issues'])
+        self.assertIn('Backlogs',saved.json()['imputed_fields'])
+        self.assertEqual(self.client.post(f'/api/candidates/{screening_id}/predict').status_code,200)
+        self.assertEqual(self.client.post('/api/screenings/export-csv',json={'screening_ids':[screening_id],'mode':'draft'}).status_code,200)
+        self.assertEqual(self.client.post('/api/screenings/export-csv',json={'screening_ids':[screening_id]}).status_code,200)
+
+    def test_14_more_than_fifteen_pages_can_be_extracted(self):
+        doc=fitz.open()
+        for number in range(17):
+            page=doc.new_page()
+            page.insert_text((50,60),'Example Candidate resume text with sufficient embedded text for page '+str(number))
+        data=doc.tobytes();doc.close()
+        result=self.client.post('/api/screenings?job_id=JOB_001',files={'file':('long-resume.pdf',data,'application/pdf')})
+        self.assertEqual(result.status_code,200,result.text)
+        item=self.client.get('/api/screenings/'+result.json()['id']).json()
+        self.assertEqual(item['total_pages'],17)
+        self.assertEqual(len(item['extraction_methods']),17)
 
 
 if __name__ == '__main__':

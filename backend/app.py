@@ -30,14 +30,13 @@ from backend.pipeline.config import MAXIMA
 from backend.pipeline.schema import RAW_COLUMNS
 from backend.pipeline.feature_engineering import make_features
 from backend.gemini_parser import extract_with_gemini, parser_status, GeminiError
+from backend.resume_sections import extract_sections
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / '.runtime'
 UPLOADS = RUNTIME / 'uploads'
 STATE_FILE = RUNTIME / 'state.json'
 CSV_FILE = ROOT / 'AI_Fresher_Recruitment_ML_Dataset.csv'
-MAX_UPLOAD = 10 * 1024 * 1024
-MAX_PAGES = 15
 LOCK = threading.RLock()
 OCR_LOCK = threading.Lock()
 EXTRACTION_SLOTS = threading.Semaphore(2)
@@ -105,7 +104,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title='Sprout · Fresher Recruitment V1', lifespan=lifespan)
+app = FastAPI(title='Incepta · Fresher Recruitment', lifespan=lifespan)
 
 
 class JobInput(BaseModel):
@@ -343,21 +342,25 @@ def _extract_resume(screening_id):
                     methods.append(f'Page {i + 1}: embedded text')
                 texts.append(text)
         text = '\n\n'.join(texts)
-        if len(text.strip()) < 15:
-            raise ValueError('No readable text was found. Please use a clearer PDF.')
+        if not text.strip():
+            warnings.append('No readable text was found. Fields remain Not provided and can be reviewed manually.')
         update_screening(screening_id, status='parsing')
         data = parse_resume(text)
-        parser_metadata = {'parser': 'local', 'parser_model': None, 'evidence': {}}
+        _, grouped = extract_sections(text)
+        parser_metadata = {'parser': 'local', 'parser_model': None, 'evidence': grouped}
         if parser_status()['gemini_configured']:
             try:
                 update_screening(screening_id, status='structuring')
                 result = extract_with_gemini(text)
-                data = result['data']
+                data = {key:result['data'].get(key) if result['data'].get(key) is not None else value for key,value in data.items()}
                 warnings.extend(result['warnings'])
                 parser_metadata = {key: result[key] for key in ('parser', 'parser_model', 'evidence')}
+                parser_metadata['evidence']={**grouped,**result['evidence']}
             except GeminiError as exc:
                 warnings.append(str(exc) + ' Local parsing was used instead; review all fields.')
-        warnings.append('Extraction is a draft. Confirm grades, backlog information, and section entries before prediction.')
+        for section in ('Projects','Internships','Certifications','Achievements'):
+            data['Number of '+section]=len(data[section]) if data.get(section) is not None else None
+        warnings.append('Extraction is a draft. Missing details are Not provided; validation runs before model processing.')
         update_screening(screening_id, status='checking_fields')
         validation_issues = validate_confirmed(dict(data))
         update_screening(screening_id, status='ready', data=data, text=text, extraction_methods=methods,
@@ -374,7 +377,7 @@ def parse_resume(text):
         return match.group(1).strip() if match else None
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    name = next((line for line in lines[:4] if re.fullmatch(r'[A-Za-z .\-]{3,60}', line) and not re.search(r'resume|curriculum|vitae|profile', line, re.I)), None)
+    name = next((line for line in lines[:4] if re.fullmatch(r'[A-Za-z .\-]+', line) and not re.search(r'resume|curriculum|vitae|profile|education|skills|projects|experience', line, re.I)), None)
     cgpa = search(r'(?:CGPA|GPA)\s*[:=\-]?\s*(\d+(?:\.\d+)?)')
     if cgpa and float(cgpa) > 10:
         cgpa = None
@@ -382,7 +385,7 @@ def parse_resume(text):
     if scale and float(scale) != 10:
         cgpa = None
     def school_percentage(label):
-        value = search(label + r'\s*(?:percentage|marks|score)?\s*[:=\-]?\s*(\d+(?:\.\d+)?)\s*%')
+        value = search(label + r'[^\n%]*?(\d+(?:\.\d+)?)\s*%')
         return float(value) if value is not None and 0 <= float(value) <= 100 else None
     degree_raw = search(r'\b(B\.?\s?Tech|B\.?\s?E\.?|B\.?\s?Sc\.?|BCA|MCA|M\.?\s?Tech|M\.?\s?Sc\.?)\b')
     degree_key = re.sub(r'[.\s]', '', degree_raw or '').lower()
@@ -393,34 +396,19 @@ def parse_resume(text):
             found_skills.append(skill)
     specialization = search(r'\b(Computer Science(?: and Engineering)?|Information Technology|Artificial Intelligence|Data Science|Electronics(?: and Communication)?|Mechanical Engineering)\b')
     backlogs = search(r'backlogs?\s*[:=\-]?\s*(\d+)')
-    sections = {'Projects': [], 'Internships': [], 'Certifications': [], 'Achievements': []}
-    heading_map = {'projects': 'Projects', 'academic projects': 'Projects', 'personal projects': 'Projects',
-                   'internships': 'Internships', 'internship experience': 'Internships', 'certifications': 'Certifications',
-                   'certificates': 'Certifications', 'achievements': 'Achievements', 'awards': 'Achievements'}
-    current = None
-    explicitly_empty = set()
-    for line in lines:
-        if re.search(r'FICTIONAL TEST RESUME|Not a real applicant|Incepta prototype', line, re.I) or line.isdigit():
-            continue
-        heading = re.sub(r'[^a-z ]', '', line.casefold()).strip()
-        if heading in heading_map:
-            current = heading_map[heading]
-        elif heading in ['education', 'skills', 'technical skills', 'experience', 'work experience', 'summary', 'contact', 'interests']:
-            current = None
-        elif current and len(line) < 150:
-            if re.fullmatch(r'none(?:\s*[-–:]\s*explicitly declared by candidate)?', line, re.I):
-                explicitly_empty.add(current)
-            else:
-                sections[current].append(re.sub(r'^[•\-*\d.)\s]+', '', line))
+    if backlogs is None and re.search(r'\b(?:no\s+(?:active\s+)?backlogs?|backlogs?\s*[:=\-]\s*(?:none|nil))\b',text,re.I):
+        backlogs='0'
+    sections, _ = extract_sections(text)
     data = {'Full Name': name, 'Email': search(r'([\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,})'),
             'Degree': degree, 'Specialization': specialization, 'CGPA': float(cgpa) if cgpa else None,
-            'Class 10 Percentage': school_percentage(r'(?:Class\s*(?:10|X)\b|10th\b|SSC\b)'),
-            'Class 12 Percentage': school_percentage(r'(?:Class\s*(?:12|XII)\b|12th\b|HSC\b)'),
+            'Class 10 Percentage': school_percentage(r'(?:Class\s*(?:10|X)\b|10th\b|SSLC?\b|matriculation\b)'),
+            'Class 12 Percentage': school_percentage(r'(?:Class\s*(?:12|XII)\b|12th\b|HSC\b|higher secondary\b|senior secondary\b|intermediate\b)'),
             'Backlogs': int(backlogs) if backlogs is not None else None,
             'Skills': found_skills or None}
     for key, entries in sections.items():
-        data[key] = list(dict.fromkeys(entries)) if entries else ([] if key in explicitly_empty else None)
-        # Draft section lines may include descriptions. Counts require explicit HR confirmation.
+        if key != 'Work Experience':data[key]=entries
+        if key in ('Projects','Internships','Certifications','Achievements'):
+            data['Number of '+key]=len(entries) if entries is not None else None
     return data
 
 
@@ -430,6 +418,12 @@ def screening_response(s):
     result['source'] = 'Resume upload'
     result['review'] = state['reviews'].get(s['id'], 'Pending')
     result['job'] = find_job(s['job_id'])
+    from backend.pipeline.validation import validate_records
+    prepared, filled = prepared_model_record(s)
+    _, invalid = validate_records([prepared])
+    result['model_ready'] = not invalid and s.get('status') in ('ready', 'completed')
+    result['imputed_fields'] = filled
+    result['validation_issues'] = [row['Errors'] for row in invalid]
     return clean(result)
 
 
@@ -438,20 +432,15 @@ async def upload(background_tasks: BackgroundTasks, job_id: str, file: UploadFil
     job = find_job(job_id)
     if job['status'] != 'Active':
         raise HTTPException(422, 'Select an active job opening.')
-    data = await file.read(MAX_UPLOAD + 1)
+    data = await file.read()
     await file.close()
-    if len(data) > MAX_UPLOAD:
-        raise HTTPException(413, 'Please upload a PDF smaller than 10 MB.')
     if not data.startswith(b'%PDF-') or not (file.filename or '').lower().endswith('.pdf'):
         raise HTTPException(422, 'Only PDF resumes are supported.')
     try:
         with fitz.open(stream=data, filetype='pdf') as doc:
             if doc.is_encrypted:
                 raise ValueError('Password-protected PDFs are not supported.')
-            if not 1 <= len(doc) <= MAX_PAGES:
-                raise ValueError('Resumes must contain 1–15 pages.')
-            if any(page.rect.width * page.rect.height > 4_000_000 for page in doc):
-                raise ValueError('PDF page dimensions are too large. Please upload a standard-size PDF.')
+            if not len(doc):raise ValueError('This PDF has no pages.')
     except Exception as exc:
         raise HTTPException(422, str(exc) if isinstance(exc, ValueError) else 'This PDF could not be read.') from exc
     screening_id = 'RES_' + uuid.uuid4().hex[:12].upper()
@@ -482,6 +471,7 @@ def get_resume(screening_id: str):
 
 class DataInput(BaseModel):
     data: dict
+    allow_incomplete: bool = False
 
 
 NUMERIC_FIELDS = ['CGPA', 'Class 10 Percentage', 'Class 12 Percentage', 'Backlogs']
@@ -490,6 +480,9 @@ LIST_FIELDS = ['Skills', 'Projects', 'Internships', 'Certifications', 'Achieveme
 
 def validate_confirmed(data):
     errors = []
+    for key,value in list(data.items()):
+        if isinstance(value,str) and value.strip().casefold() in ('not provided','not available','n/a'):
+            data[key]=None
     for key in ['Degree', 'Specialization'] + NUMERIC_FIELDS + LIST_FIELDS:
         if key not in data or data[key] is None or data[key] == '':
             errors.append(f'{key} is missing. Enter a confirmed value.')
@@ -499,7 +492,7 @@ def validate_confirmed(data):
             continue
         try:
             number = float(value)
-            upper = 10 if key == 'CGPA' else (100 if 'Percentage' in key else 1000)
+            upper = 10 if key == 'CGPA' else (100 if 'Percentage' in key else float('inf'))
             if not math.isfinite(number) or not 0 <= number <= upper or (key == 'Backlogs' and not number.is_integer()):
                 raise ValueError()
             data[key] = int(number) if key == 'Backlogs' else number
@@ -520,10 +513,12 @@ def confirm_data(screening_id: str, payload: DataInput):
         raise HTTPException(409, 'Wait for extraction to finish before confirming data.')
     data = {k: v for k, v in payload.data.items() if k in ['Full Name', 'Email', 'Degree', 'Specialization'] + NUMERIC_FIELDS + LIST_FIELDS}
     errors = validate_confirmed(data)
-    if errors:
+    if errors and not payload.allow_incomplete:
         update_screening(screening_id, data=data, confirmed=False, probability=None, segment='Needs Data Review')
         raise HTTPException(422, {'message': 'Please complete the required model inputs.', 'fields': errors})
-    update_screening(screening_id, data=data, confirmed=True, probability=None, segment='Needs Data Review', status='ready')
+    # Review can be saved with unknowns; model admission remains a separate validation gate.
+    update_screening(screening_id, data=data, confirmed=True, probability=None, recruitment_score=None,
+                     pipeline_result=None, validation_issues=errors, segment='Needs Data Review', status='ready')
     return get_screening(screening_id)
 
 
@@ -542,8 +537,13 @@ def raw_record(s, data=None):
     return r
 
 
+def prepared_model_record(s, data=None):
+    from backend.pipeline.missing_values import prepare_model_record
+    return prepare_model_record(raw_record(s, data), dataset.to_dict('records'))
+
+
 class ScreeningExport(BaseModel):
-    screening_ids: list[str] = Field(min_length=1, max_length=100)
+    screening_ids: list[str] = Field(min_length=1)
     mode: str = 'model'
 
 
@@ -558,9 +558,7 @@ def export_screenings(payload: ScreeningExport):
         s = get_screening(screening_id)
         if s['status'] not in ('ready', 'completed'):
             raise HTTPException(409, 'Wait for extraction to finish; failed documents cannot be exported.')
-        if payload.mode == 'model' and not s.get('confirmed'):
-            raise HTTPException(409, 'Review and confirm every selected resume before downloading model-ready data.')
-        records.append(raw_record(s))
+        records.append(prepared_model_record(s)[0] if payload.mode == 'model' else raw_record(s))
     if payload.mode == 'model':
         from backend.pipeline.validation import validate_records
         valid, errors = validate_records(records)
@@ -580,13 +578,14 @@ def export_screenings(payload: ScreeningExport):
 def model_mapping(s, data=None):
     if not artifact:
         raise HTTPException(503, model_error or 'Model unavailable.')
-    record = raw_record(s, data)
+    record, filled = prepared_model_record(s, data)
     from backend.pipeline.validation import validate_records
     valid, invalid = validate_records([record])
     if invalid:
         raise HTTPException(422, invalid[0]['Errors'])
     features = make_features(valid[0])
     return {'raw_record': clean({key: valid[0][key] for key in raw_columns}),
+            'imputed_fields': filled,
             'model_inputs': clean({key: features[key] for key in artifact['feature_columns']}),
             'feature_count': len(artifact['feature_columns']), 'normalization_constants': normalizers,
             'model_name': artifact['model_name'], 'threshold': float(artifact['threshold']),
@@ -611,9 +610,13 @@ def predict(application_id: str):
         raise HTTPException(503, model_error or 'Model unavailable.')
     if application_id in state['screenings']:
         s = state['screenings'][application_id]
-        if not s.get('confirmed'):
-            raise HTTPException(409, 'Confirm the extracted data before prediction.')
-        raw = raw_record(s)
+        if s['status'] not in ('ready', 'completed'):
+            raise HTTPException(409, 'Wait for extraction to finish before running the model.')
+        raw, imputed_fields = prepared_model_record(s)
+        from backend.pipeline.validation import validate_records
+        _, invalid=validate_records([raw])
+        if invalid:
+            raise HTTPException(422, {'message':'Validation required before model processing.', 'fields':[row['Errors'] for row in invalid]})
     else:
         frame = dataset[dataset['Application ID'] == application_id]
         if frame.empty:
@@ -634,7 +637,7 @@ def predict(application_id: str):
               'model_name': artifact['model_name'], 'feature_count': len(artifact['feature_columns']),
               'recruitment_score': pipeline_result['Recruitment_Score'], 'pipeline_result': pipeline_result}
     if application_id in state['screenings']:
-        update_screening(application_id, **result, status='completed', model_record=clean(raw))
+        update_screening(application_id, **result, status='completed', model_record=clean(raw), imputed_fields=imputed_fields)
     else:
         model_predictions[application_id] = probability
         model_recruitment_scores[application_id] = pipeline_result['Recruitment_Score']
