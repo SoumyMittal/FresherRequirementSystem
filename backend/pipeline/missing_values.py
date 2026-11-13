@@ -41,19 +41,25 @@ def recover_candidate_fields(records):
     return result
 
 
-def prepare_model_record(record, reference):
+def prepare_model_record(record, reference, fallbacks=None):
     """Notebook 03 fallbacks on a copy; never overwrite extracted evidence.
 
     Reference rows supply stable medians/modes rather than upload-batch statistics.
     """
+    result = dict(record)
+    if fallbacks is None:
+        fallbacks = reference_fallbacks(reference, (field for field in PROFILE_FIELDS if missing(result.get(field))))
+    filled = {field: info for field, info in fallbacks.items() if missing(result.get(field))}
+    result.update({field: info['value'] for field, info in filled.items()})
+    return result, filled
+
+
+def reference_fallbacks(reference, fields=PROFILE_FIELDS):
     from statistics import median
     from collections import Counter
 
-    result = dict(record)
     filled = {}
-    for field in PROFILE_FIELDS:
-        if not missing(result.get(field)):
-            continue
+    for field in fields:
         values = [row.get(field) for row in reference if not missing(row.get(field))]
         if field in NUMERIC_BOUNDS:
             lo, hi, integer = NUMERIC_BOUNDS[field]
@@ -69,13 +75,13 @@ def prepare_model_record(record, reference):
                 continue
             value = median(numbers)
             # Counts must stay integral even when the median falls between integers.
-            result[field] = int(math.floor(value + .5)) if integer else value
+            value = int(math.floor(value + .5)) if integer else value
             rule = 'reference median'
         elif field == 'Specialization' and values:
-            result[field] = Counter(str(v).strip() for v in values).most_common(1)[0][0]
+            value = Counter(str(v).strip() for v in values).most_common(1)[0][0]
             rule = 'reference mode'
         else:
-            result[field] = 'Not Provided'
+            value = 'Not Provided'
             rule = 'missing text marker'
-        filled[field] = {'value': result[field], 'method': rule}
-    return result, filled
+        filled[field] = {'value': value, 'method': rule}
+    return filled

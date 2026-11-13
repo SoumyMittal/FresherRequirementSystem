@@ -9,7 +9,7 @@ from .schema import EXPECTED_FEATURES
 def load_artifact(path):
     artifact = joblib.load(path)
     validate_artifact(artifact)
-    version = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    version = hashlib.sha256(path.read_bytes()).hexdigest()
     return artifact, version
 
 
@@ -20,6 +20,8 @@ def validate_artifact(artifact):
     columns = artifact['feature_columns']
     if len(columns) != len(set(columns)) or set(columns) != set(EXPECTED_FEATURES):
         raise ValueError('Saved feature_columns do not match the versioned feature schema.')
+    if list(getattr(artifact['pipeline'], 'feature_names_in_', [])) != list(columns):
+        raise ValueError('Saved feature_columns do not match the fitted pipeline input order.')
     threshold = float(artifact['threshold'])
     if not math.isfinite(threshold) or not 0 <= threshold <= 1 or artifact['target'] != 'Shortlisted':
         raise ValueError('Saved model target or threshold is incompatible.')

@@ -37,6 +37,7 @@ class Candidate(BaseModel):
 
 
 from backend.resume_sections import ResumeEntry, PUBLICATION_REGEX, normalize_text_for_match
+from backend.resume_validation import specialization_facts, specialization_key
 
 
 class Entry(BaseModel):
@@ -112,6 +113,8 @@ def extract_with_gemini(text):
         'Publications, research papers, conference papers, journal articles, and patents must be categorized as achievements, NEVER projects. '
         'Every non-null value and entry must have an exact source_text quote from the resume supporting the value/title. '
         'Preserve titles and descriptions. '
+        'For specialization, quote the education clause and preserve the entire program name, including any disciplines joined by and or &. '
+        'Do not infer a specialization from skills, coursework, interests, or project descriptions. '
         'CGPA must be explicitly on a 10-point scale (or labelled CGPA with no alternate scale); '
         'GPA on any other scale remains null. School marks must be explicit percentages. '
         'Return JSON following the supplied schema. Do not add facts, counts, scores or job information.'
@@ -147,6 +150,23 @@ def extract_with_gemini(text):
         fact = getattr(extraction.candidate, key_name)
         value, source = fact.value, fact.source_text
         valid = value is not None and has_evidence(source, text) and supported_value(value, source or '')
+        if field == 'Specialization' and value is not None and has_evidence(source, text):
+            candidates = specialization_facts([source])
+            if not candidates:
+                candidates = {key: (name, quotes) for key, (name, quotes) in specialization_facts([text]).items()
+                              if any(has_evidence(source, quote['text']) for quote in quotes)}
+            key = specialization_key(value)
+            if key in candidates:
+                value = candidates[key][0]
+                valid = True
+            elif len(candidates) == 1:
+                full_key, (full_name, _) = next(iter(candidates.items()))
+                # A quoted education clause can recover a truncated component.
+                valid = bool(key and key in full_key.split(' and '))
+                if valid:
+                    value = full_name
+            else:
+                valid = False
         if valid and isinstance(fact, NumberFact):
             limit = 10 if key_name == 'cgpa' else 100 if 'percentage' in key_name else float('inf')
             valid = 0 <= value <= limit and (key_name != 'backlogs' or value.is_integer())

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -9,9 +10,11 @@ import math
 import os
 import re
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 # Keep CPU inference small enough for a laptop alongside the browser.
@@ -24,23 +27,28 @@ import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from backend.pipeline import RecruitmentPipeline
 from backend.pipeline.config import MAXIMA
 from backend.pipeline.schema import RAW_COLUMNS
+from backend.pipeline.missing_values import prepare_model_record, reference_fallbacks
 from backend.pipeline.feature_engineering import make_features
+from backend.pipeline.validation import normalize_number
 from backend.gemini_parser import extract_with_gemini, parser_status, GeminiError
-from backend.resume_sections import extract_sections, reconcile_and_deduplicate, derive_counts
+from backend.resume_sections import extract_sections, reconcile_and_deduplicate
+from backend.resume_validation import NUMERIC_FIELDS, LIST_FIELDS, PROFILE_FIELDS, DEGREE, DEGREES, issue, specialization_facts
+from backend.shortlisting import DEFAULT_RATIO, active_allocation, allocation_summary, capacity_config
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNTIME = ROOT / '.runtime'
+RUNTIME = Path(os.environ.get('INCEPTA_RUNTIME', ROOT / '.runtime')).resolve()
 UPLOADS = RUNTIME / 'uploads'
 STATE_FILE = RUNTIME / 'state.json'
 CSV_FILE = ROOT / 'AI_Fresher_Recruitment_ML_Dataset.csv'
 LOCK = threading.RLock()
 OCR_LOCK = threading.Lock()
-EXTRACTION_SLOTS = threading.Semaphore(2)
-state: dict = {'jobs': {}, 'screenings': {}, 'reviews': {}}
+EXTRACTION_SLOTS = threading.Semaphore(max(1, int(os.environ.get('INCEPTA_EXTRACTION_WORKERS', '2'))))
+STATE_KEYS = ('jobs', 'screenings', 'reviews', 'decision_history', 'batches', 'model_runs', 'job_allocations', 'job_configuration_history')
+state: dict = {key: {} for key in STATE_KEYS}
 dataset = pd.DataFrame()
 artifact = None
 recruitment_pipeline = None
@@ -51,6 +59,12 @@ model_recruitment_scores: dict[str, float] = {}
 raw_columns: list[str] = []
 normalizers: dict[str, float] = {}
 skill_vocabulary: list[str] = []
+model_fallbacks = {}
+ACTIVE_EXTRACTION = ('queued', 'extracting_text', 'ocr', 'parsing', 'structuring', 'checking_fields')
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def clean(value):
@@ -70,23 +84,44 @@ def persist():
         RUNTIME.mkdir(exist_ok=True)
         temp = STATE_FILE.with_suffix('.tmp')
         temp.write_text(json.dumps(clean(state), indent=2, allow_nan=False), encoding='utf-8')
-        os.replace(temp, STATE_FILE)
+        for attempt in range(5):
+            try:
+                os.replace(temp, STATE_FILE)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(.025 * (attempt + 1))
 
 
 def initialize():
-    global dataset, artifact, model_error, raw_columns, normalizers, skill_vocabulary, recruitment_pipeline
+    global dataset, artifact, model_error, raw_columns, normalizers, skill_vocabulary, recruitment_pipeline, model_fallbacks
     UPLOADS.mkdir(parents=True, exist_ok=True)
     dataset = pd.read_csv(CSV_FILE).fillna('')
     raw_columns = list(RAW_COLUMNS)
     normalizers = dict(MAXIMA)
     skill_vocabulary = sorted({s.strip() for value in dataset['Skills'] for s in str(value).split(',') if s.strip()}, key=len, reverse=True)
-    if STATE_FILE.exists():
-        loaded = json.loads(STATE_FILE.read_text(encoding='utf-8'))
-        for key in state:
-            state[key] = loaded.get(key, {})
+    model_fallbacks = reference_fallbacks(dataset.to_dict('records'))
+    loaded = json.loads(STATE_FILE.read_text(encoding='utf-8')) if STATE_FILE.exists() else state.copy()
+    for key in STATE_KEYS:
+        state[key] = loaded.get(key, {})
+    recovered = False
     for screening in state['screenings'].values():
-        if screening['status'] in ('queued', 'extracting_text', 'ocr', 'parsing', 'structuring', 'checking_fields'):
-            screening.update(status='failed', error='Processing was interrupted. Please upload the resume again.')
+        path = UPLOADS / (screening['id'] + '.pdf')
+        if not screening.get('file_hash') and path.is_file():
+            with path.open('rb') as stream:
+                screening['file_hash'] = hashlib.file_digest(stream, 'sha256').hexdigest()
+            recovered = True
+        if screening['status'] in ACTIVE_EXTRACTION:
+            screening.update(status='failed', error='Extraction was interrupted. Retry this file.',
+                             route='review', segment='Needs Data Review')
+            recovered = True
+    for run in state['model_runs'].values():
+        if run['status'] == 'running':
+            run.update(status='failed', error='Assessment was interrupted. Run the batch again.', finished_at=now())
+            recovered = True
+    if recovered:
+        persist()
     try:
         recruitment_pipeline = RecruitmentPipeline()
         artifact = recruitment_pipeline.artifact
@@ -95,7 +130,7 @@ def initialize():
     except Exception as exc:
         artifact = None
         model_error = f'Model could not be loaded ({type(exc).__name__}). Check the installed training dependencies.'
-        logging.exception('Model initialization failed')
+        logging.error('Model initialization failed (%s)', type(exc).__name__)
 
 
 @asynccontextmanager
@@ -113,19 +148,35 @@ class JobInput(BaseModel):
     preferred_degree: list[str] = Field(min_length=1, max_length=20)
     minimum_cgpa: float = Field(ge=0, le=10)
     openings: int = Field(ge=1, le=10000)
+    shortlisting_ratio: Decimal = Field(default=DEFAULT_RATIO, gt=0, max_digits=9, decimal_places=3, allow_inf_nan=False)
     status: str = 'Active'
 
+    @field_validator('openings', 'shortlisting_ratio', mode='before')
+    @classmethod
+    def reject_boolean(cls, value):
+        if isinstance(value, bool):
+            raise ValueError('Enter a number.')
+        return value
 
-def jobs_list():
+
+def jobs_list(include_allocation=False):
     cols = ['Job ID', 'Job Role', 'Number of Openings', 'Required Skills', 'Preferred Degree', 'Minimum CGPA']
     jobs = {}
     for row in dataset[cols].drop_duplicates('Job ID').to_dict('records'):
         jobs[row['Job ID']] = {'id': row['Job ID'], 'title': row['Job Role'], 'openings': int(row['Number of Openings']),
                               'required_skills': split_list(row['Required Skills']), 'preferred_degree': split_list(row['Preferred Degree']),
                               'minimum_cgpa': float(row['Minimum CGPA']), 'status': 'Active'}
-    jobs.update(state['jobs'])
+    with LOCK:
+        jobs.update({key: dict(job) for key, job in state['jobs'].items()})
+        screenings = list(state['screenings'].values())
+        for job in jobs.values():
+            job.update(capacity_config(job))
+            if include_allocation:
+                job['allocation'] = allocation_summary(screenings, job, active_allocation(job['id'], state))
+                job['configuration_history'] = list(state['job_configuration_history'].get(job['id'], []))
+        uploaded_jobs = [s['job_id'] for s in screenings]
     for job in jobs.values():
-        job['applications'] = int((dataset['Job ID'] == job['id']).sum()) + sum(s['job_id'] == job['id'] for s in state['screenings'].values())
+        job['applications'] = int((dataset['Job ID'] == job['id']).sum()) + uploaded_jobs.count(job['id'])
     return list(jobs.values())
 
 
@@ -148,7 +199,7 @@ def segment(probability):
     return 'Potential Match' if probability >= float(artifact['threshold']) else 'Lower Model Match'
 
 
-def candidate_rows(job_id='', query='', selected_segment='', review=''):
+def candidate_rows(job_id='', query='', selected_segment='', review='', route=''):
     frame = dataset
     if job_id:
         frame = frame[frame['Job ID'] == job_id]
@@ -163,16 +214,21 @@ def candidate_rows(job_id='', query='', selected_segment='', review=''):
                      'recruitment_score': model_recruitment_scores.get(app_id) if probability is not None else None,
                      'source': 'ML dataset', 'review': state['reviews'].get(app_id, 'Pending')})
     jobs = {j['id']: j for j in jobs_list()}
-    for s in state['screenings'].values():
+    with LOCK:
+        screenings = [dict(s) for s in state['screenings'].values()]
+    for s in screenings:
         if job_id and s['job_id'] != job_id:
             continue
         d = s.get('data', {})
         rows.append({'id': s['id'], 'candidate_id': s['candidate_id'], 'name': d.get('Full Name') or s['candidate_id'],
                      'job_id': s['job_id'], 'job': jobs[s['job_id']]['title'], 'degree': d.get('Degree'),
                      'specialization': d.get('Specialization'), 'cgpa': d.get('CGPA'), 'skills': split_list(d.get('Skills')),
-                     'score': None, 'recruitment_score': s.get('recruitment_score') if s.get('confirmed') and s.get('probability') is not None else None,
-                     'probability': s.get('probability'), 'segment': s.get('segment', 'Needs Data Review'),
-                     'source': 'Resume upload', 'review': state['reviews'].get(s['id'], 'Pending'), 'status': s['status']})
+                     'score': None, 'recruitment_score': s.get('recruitment_score') if s.get('probability') is not None else None,
+                     'probability': s.get('probability'), 'segment': s.get('segment', 'Not assessed'),
+                     'route': s.get('route', 'not_assessed'), 'rank': (s.get('pipeline_result') or {}).get('Model_Rank'),
+                     'run_id': s.get('run_id'), 'extracted_at': s.get('extracted_at'), 'assessed_at': s.get('assessed_at'),
+                     'source': 'Resume upload', 'review': state['reviews'].get(
+                         s['id'], 'Pending HR Review' if s.get('batch_id') else 'Pending'), 'status': s['status']})
     if query:
         needle = query.casefold()
         rows = [r for r in rows if needle in ' '.join(str(r.get(k, '')) for k in ['name', 'id', 'job', 'degree', 'skills']).casefold()]
@@ -180,6 +236,8 @@ def candidate_rows(job_id='', query='', selected_segment='', review=''):
         rows = [r for r in rows if r['segment'] == selected_segment]
     if review:
         rows = [r for r in rows if r['review'] == review]
+    if route:
+        rows = [r for r in rows if r.get('route') == route]
     rows.sort(key=lambda r: (r['probability'] if r['probability'] is not None else -1, r['score'] if r['score'] is not None else -1, r['id']), reverse=True)
     return rows
 
@@ -208,7 +266,15 @@ def summary():
 
 @app.get('/api/jobs')
 def get_jobs():
-    return clean(jobs_list())
+    return clean(jobs_list(include_allocation=True))
+
+
+@app.get('/api/jobs/{job_id}')
+def get_job(job_id: str):
+    job = next((job for job in jobs_list(include_allocation=True) if job['id'] == job_id), None)
+    if job is None:
+        raise HTTPException(404, 'Job opening not found.')
+    return clean(job)
 
 
 @app.post('/api/jobs')
@@ -227,15 +293,29 @@ def save_job(job_id, payload):
     job = {'id': job_id, 'title': payload.title.strip(), 'openings': payload.openings, 'required_skills': skills,
            'preferred_degree': degrees, 'minimum_cgpa': payload.minimum_cgpa, 'status': payload.status}
     with LOCK:
+        previous = next((j for j in jobs_list() if j['id'] == job_id), {})
+        ratio = payload.shortlisting_ratio if 'shortlisting_ratio' in payload.model_fields_set else previous.get('shortlisting_ratio', DEFAULT_RATIO)
+        job['shortlisting_ratio'] = float(ratio)
+        changed = any(previous.get(key) != value for key, value in job.items() if key != 'status')
+        capacity_changed = bool(previous and capacity_config(previous) != capacity_config(job))
+        job['version'] = previous.get('version', 1) + int(bool(previous) and changed)
         state['jobs'][job_id] = job
+        if capacity_changed:
+            active = active_allocation(job_id, state)
+            state['job_configuration_history'].setdefault(job_id, []).append({
+                'previous': capacity_config(previous), 'current': capacity_config(job), 'timestamp': now(),
+                'active_run_id': active['run_id'] if active else None, 'version': job['version'],
+            })
         for s in state['screenings'].values():
-            if s['job_id'] == job_id:
+            if s['job_id'] == job_id and changed and not capacity_changed and s.get('batch_id'):
+                invalidate_assessment(s)
+            elif s['job_id'] == job_id and changed and not capacity_changed:
                 s.update(confirmed=False, probability=None, segment='Needs Data Review')
         for app_id in dataset.loc[dataset['Job ID'] == job_id, 'Application ID']:
             model_predictions.pop(app_id, None)
             model_recruitment_scores.pop(app_id, None)
         persist()
-    return job
+    return {**job, **capacity_config(job)}
 
 
 @app.put('/api/jobs/{job_id}')
@@ -245,10 +325,14 @@ def update_job(job_id: str, payload: JobInput):
 
 
 @app.get('/api/candidates')
-def get_candidates(job_id: str = '', q: str = '', segment: str = '', review: str = '', page: int = 1, limit: int = 12, sort: str = ''):
-    rows = candidate_rows(job_id, q, segment, review)
+def get_candidates(job_id: str = '', q: str = '', segment: str = '', review: str = '', page: int = 1, limit: int = 12, sort: str = '', route: str = ''):
+    rows = candidate_rows(job_id, q, segment, review, route)
     if sort == 'dataset':
         rows.sort(key=lambda r: (r['score'] if r['score'] is not None else -1, r['id']), reverse=True)
+    if sort == 'rank':
+        rows.sort(key=lambda r: (r['job_id'], r.get('rank') or math.inf, r['id']))
+    if sort == 'weighted':
+        rows.sort(key=lambda r: (-(r.get('recruitment_score') if r.get('recruitment_score') is not None else -math.inf), r['id']))
     limit = min(max(limit, 1), 100)
     page = max(page, 1)
     start = (page - 1) * limit
@@ -256,8 +340,8 @@ def get_candidates(job_id: str = '', q: str = '', segment: str = '', review: str
 
 
 @app.get('/api/export')
-def export(job_id: str = '', q: str = '', segment: str = '', review: str = ''):
-    rows = candidate_rows(job_id, q, segment, review)
+def export(job_id: str = '', q: str = '', segment: str = '', review: str = '', route: str = ''):
+    rows = candidate_rows(job_id, q, segment, review, route)
     out = io.StringIO(newline='')
     writer = csv.writer(out)
     writer.writerow(['Application ID', 'Candidate', 'Job Role', 'Degree', 'CGPA', 'Dataset Score', 'Recruitment Score', 'Model Score', 'Segment', 'HR Review', 'Source'])
@@ -279,20 +363,29 @@ def detail(application_id: str):
     return clean({'id': application_id, 'data': r, 'source': 'ML dataset', 'confirmed': True, 'status': 'completed',
                   'probability': probability, 'segment': segment(probability) if probability is not None else ('Dataset Shortlist' if int(r['Shortlisted']) else 'Dataset Pool'),
                   'review': state['reviews'].get(application_id, 'Pending'), 'warnings': [], 'job_id': r['Job ID'],
+                  'decision_history': state['decision_history'].get(application_id, []),
                   'recruitment_score': model_recruitment_scores.get(application_id) if probability is not None else None})
 
 
 class ReviewInput(BaseModel):
     status: str
+    reason: str = Field(default='', max_length=1000)
 
 
 @app.patch('/api/candidates/{application_id}/review')
 def review_candidate(application_id: str, payload: ReviewInput):
     detail(application_id)
-    if payload.status not in ('Pending', 'Reviewed', 'Shortlisted', 'Not progressing'):
+    if payload.status not in ('Pending', 'Reviewed', 'Shortlisted', 'Not progressing',
+                               'Pending HR Review', 'Under Review', 'Selected', 'Rejected', 'On Hold'):
         raise HTTPException(422, 'Invalid review status.')
     with LOCK:
+        screening = state['screenings'].get(application_id, {})
+        previous = state['reviews'].get(application_id, 'Pending HR Review' if screening.get('batch_id') else 'Pending')
         state['reviews'][application_id] = payload.status
+        if previous != payload.status or payload.reason.strip():
+            state['decision_history'].setdefault(application_id, []).append(
+                {'previous': previous, 'status': payload.status, 'reason': payload.reason.strip(),
+                 'actor': None, 'timestamp': now()})
         persist()
     return {'status': payload.status}
 
@@ -318,7 +411,8 @@ def _extract_resume(screening_id):
     try:
         path = UPLOADS / (screening_id + '.pdf')
         update_screening(screening_id, status='extracting_text')
-        texts, methods, warnings = [], [], []
+        screening = state['screenings'][screening_id]
+        texts, methods, warnings, uncertain = [], [], [], {}
         with fitz.open(path) as doc:
             update_screening(screening_id, total_pages=len(doc))
             for i, page in enumerate(doc):
@@ -338,6 +432,9 @@ def _extract_resume(screening_id):
                     methods.append(f'Page {i + 1}: OCR')
                     if result and any(float(item[2]) < 0.8 for item in result):
                         warnings.append(f'Page {i + 1} contains uncertain OCR text. Check it against the PDF.')
+                        uncertain[i + 1] = [item[1] for item in result if float(item[2]) < 0.8]
+                    if not text.strip():
+                        uncertain[i + 1] = []
                 else:
                     methods.append(f'Page {i + 1}: embedded text')
                 texts.append(text)
@@ -346,7 +443,8 @@ def _extract_resume(screening_id):
             warnings.append('No readable text was found. Fields remain Not provided and can be reviewed manually.')
         update_screening(screening_id, status='parsing')
         data = parse_resume(text)
-        _, grouped = extract_sections(text)
+        local_values, grouped = extract_sections(text)
+        local_data = dict(data)
         parser_metadata = {'parser': 'local', 'parser_model': None, 'evidence': grouped}
         gemini_result = None
         if parser_status()['gemini_configured']:
@@ -360,25 +458,30 @@ def _extract_resume(screening_id):
                 parser_metadata['parser'] = gemini_result['parser']
                 parser_metadata['parser_model'] = gemini_result['parser_model']
             except GeminiError as exc:
-                warnings.append(str(exc) + ' Local parsing was used instead; review all fields.')
+                warnings.append(str(exc) + ' Local parsing was used instead.')
 
         # Reconcile, classify, and deduplicate local and Gemini entries deterministically
         gemini_entries = gemini_result.get('canonical_entries') or gemini_result.get('evidence') if gemini_result else None
         reconciled_values, reconciled_evidence = reconcile_and_deduplicate(grouped, gemini_entries, text)
-        for section in ('Projects', 'Internships', 'Certifications', 'Achievements'):
-            data[section] = reconciled_values.get(section)
-            data['Number of ' + section] = len(reconciled_values[section]) if reconciled_values.get(section) is not None else None
+        for section in ('Projects', 'Internships', 'Certifications', 'Achievements', 'Work Experience'):
+            data[section] = reconciled_values[section] or ([] if local_values.get(section) == [] else None)
+            if section != 'Work Experience':
+                data['Number of ' + section] = len(data[section]) if data[section] is not None else None
 
         parser_metadata['evidence'] = reconciled_evidence
-        warnings.append('Extraction is a draft. Missing details are Not provided; validation runs before model processing.')
         update_screening(screening_id, status='checking_fields')
+        if screening.get('batch_id'):
+            finish_batch_extraction(screening, data, local_data, texts, uncertain, warnings, methods,
+                                    reconciled_evidence, gemini_result, parser_metadata)
+            return
         validation_issues = validate_confirmed(dict(data))
         update_screening(screening_id, status='ready', data=data, text=text, extraction_methods=methods,
                          warnings=warnings, validation_issues=validation_issues, segment='Needs Data Review', error=None, **parser_metadata)
     except Exception as exc:
-        logging.exception('Resume extraction failed')
-        message = str(exc) if isinstance(exc, ValueError) else 'Resume extraction failed. Check OCR dependencies and try again.'
-        update_screening(screening_id, status='failed', error=message)
+        logging.warning('Resume extraction failed (%s)', type(exc).__name__)
+        reason = 'Resume extraction failed. Retry the file or upload a readable copy.'
+        update_screening(screening_id, status='failed', route='review', segment='Needs Data Review', error=reason,
+                         field_issues=[issue('Resume', None, reason, provenance='unextractable')])
 
 
 def parse_resume(text):
@@ -397,14 +500,14 @@ def parse_resume(text):
     def school_percentage(label):
         value = search(label + r'[^\n%]*?(\d+(?:\.\d+)?)\s*%')
         return float(value) if value is not None and 0 <= float(value) <= 100 else None
-    degree_raw = search(r'\b(B\.?\s?Tech|B\.?\s?E\.?|B\.?\s?Sc\.?|BCA|MCA|M\.?\s?Tech|M\.?\s?Sc\.?)\b')
+    degree_raw = search(DEGREE)
     degree_key = re.sub(r'[.\s]', '', degree_raw or '').lower()
-    degree = {'btech': 'B.Tech', 'be': 'B.E', 'bsc': 'B.Sc', 'bca': 'BCA', 'mca': 'MCA', 'mtech': 'M.Tech', 'msc': 'M.Sc'}.get(degree_key)
+    degree = DEGREES.get(degree_key)
     found_skills = []
     for skill in skill_vocabulary:
         if re.search(r'(?<![\w])' + re.escape(skill) + r'(?![\w+#])', text, re.I):
             found_skills.append(skill)
-    specialization = search(r'\b(Computer Science(?: and Engineering)?|Information Technology|Artificial Intelligence|Data Science|Electronics(?: and Communication)?|Mechanical Engineering)\b')
+    specialization = next((name for name, _ in specialization_facts([text]).values()), None)
     backlogs = search(r'backlogs?\s*[:=\-]?\s*(\d+)')
     if backlogs is None and re.search(r'\b(?:no\s+(?:active\s+)?backlogs?|backlogs?\s*[:=\-]\s*(?:none|nil))\b',text,re.I):
         backlogs='0'
@@ -426,8 +529,20 @@ def screening_response(s):
     result = {k: v for k, v in s.items() if k != 'text'}
     result['text'] = s.get('text', '')
     result['source'] = 'Resume upload'
-    result['review'] = state['reviews'].get(s['id'], 'Pending')
+    result['review'] = state['reviews'].get(s['id'], 'Pending HR Review' if s.get('batch_id') else 'Pending')
+    result['decision_history'] = state['decision_history'].get(s['id'], [])
     result['job'] = find_job(s['job_id'])
+    if s.get('batch_id'):
+        from backend.batch_screening import possible_duplicates
+        with LOCK:
+            result['possible_duplicates'] = possible_duplicates(s, s.get('data', {}))
+            run = state['model_runs'].get(s.get('run_id'), {})
+            result['assessment_job'] = run.get('job')
+            allocation = active_allocation(s['job_id'], state)
+            result['shortlist_allocation'] = allocation
+        result['model_ready'] = s['status'] in ('ready', 'completed') and s.get('route') != 'review'
+        result['validation_issues'] = [item['field'] + ': ' + item['reason'] for item in s.get('field_issues', []) if item['blocking']]
+        return clean(result)
     from backend.pipeline.validation import validate_records
     prepared, filled = prepared_model_record(s)
     _, invalid = validate_records([prepared])
@@ -458,6 +573,7 @@ async def upload(background_tasks: BackgroundTasks, job_id: str, file: UploadFil
     with LOCK:
         state['screenings'][screening_id] = {'id': screening_id, 'candidate_id': 'CND_' + uuid.uuid4().hex[:8].upper(),
                                             'job_id': job_id, 'filename': Path(file.filename).name, 'status': 'queued',
+                                            'file_hash': hashlib.sha256(data).hexdigest(),
                                             'confirmed': False, 'data': {}, 'warnings': [], 'segment': 'Needs Data Review',
                                             'created_at': datetime.now(timezone.utc).isoformat()}
         persist()
@@ -482,10 +598,7 @@ def get_resume(screening_id: str):
 class DataInput(BaseModel):
     data: dict
     allow_incomplete: bool = False
-
-
-NUMERIC_FIELDS = ['CGPA', 'Class 10 Percentage', 'Class 12 Percentage', 'Backlogs']
-LIST_FIELDS = ['Skills', 'Projects', 'Internships', 'Certifications', 'Achievements']
+    source_verified: bool = False
 
 
 def validate_confirmed(data):
@@ -493,7 +606,7 @@ def validate_confirmed(data):
     for key,value in list(data.items()):
         if isinstance(value,str) and value.strip().casefold() in ('not provided','not available','n/a'):
             data[key]=None
-    for key in ['Degree', 'Specialization'] + NUMERIC_FIELDS + LIST_FIELDS:
+    for key in ('Degree', 'Specialization', *NUMERIC_FIELDS, *LIST_FIELDS):
         if key not in data or data[key] is None or data[key] == '':
             errors.append(f'{key} is missing. Enter a confirmed value.')
     for key in NUMERIC_FIELDS:
@@ -501,12 +614,8 @@ def validate_confirmed(data):
         if value is None or value == '':
             continue
         try:
-            number = float(value)
-            upper = 10 if key == 'CGPA' else (100 if 'Percentage' in key else float('inf'))
-            if not math.isfinite(number) or not 0 <= number <= upper or (key == 'Backlogs' and not number.is_integer()):
-                raise ValueError()
-            data[key] = int(number) if key == 'Backlogs' else number
-        except (ValueError, TypeError):
+            data[key] = normalize_number(key, value)
+        except ValueError:
             errors.append(f'{key} has an invalid value.')
     for key in LIST_FIELDS:
         if data.get(key) is not None:
@@ -519,9 +628,11 @@ def validate_confirmed(data):
 @app.put('/api/screenings/{screening_id}/data')
 def confirm_data(screening_id: str, payload: DataInput):
     s = get_screening(screening_id)
+    if s.get('batch_id'):
+        return correct_batch_profile(screening_id, payload.data, payload.source_verified)
     if s['status'] not in ('ready', 'completed'):
         raise HTTPException(409, 'Wait for extraction to finish before confirming data.')
-    data = {k: v for k, v in payload.data.items() if k in ['Full Name', 'Email', 'Degree', 'Specialization'] + NUMERIC_FIELDS + LIST_FIELDS}
+    data = {k: v for k, v in payload.data.items() if k in PROFILE_FIELDS}
     errors = validate_confirmed(data)
     if errors and not payload.allow_incomplete:
         update_screening(screening_id, data=data, confirmed=False, probability=None, segment='Needs Data Review')
@@ -532,9 +643,9 @@ def confirm_data(screening_id: str, payload: DataInput):
     return get_screening(screening_id)
 
 
-def raw_record(s, data=None):
+def raw_record(s, data=None, job=None):
     d = s['data'] if data is None else data
-    job = find_job(s['job_id'])
+    job = job or find_job(s['job_id'])
     r = {'Application ID': s['id'], 'Candidate ID': s['candidate_id'], 'Job ID': job['id'], 'Job Role': job['title'],
          'Degree': d.get('Degree'), 'Specialization': d.get('Specialization'), **{k: d.get(k) for k in NUMERIC_FIELDS},
          'Number of Openings': job['openings'], 'Required Skills': ', '.join(job['required_skills']),
@@ -551,8 +662,11 @@ def raw_record(s, data=None):
 
 
 def prepared_model_record(s, data=None):
-    from backend.pipeline.missing_values import prepare_model_record
-    return prepare_model_record(raw_record(s, data), dataset.to_dict('records'))
+    return prepared_model_record_for_raw(raw_record(s, data))
+
+
+def prepared_model_record_for_raw(raw):
+    return prepare_model_record(raw, (), model_fallbacks)
 
 
 class ScreeningExport(BaseModel):
@@ -571,7 +685,12 @@ def export_screenings(payload: ScreeningExport):
         s = get_screening(screening_id)
         if s['status'] not in ('ready', 'completed'):
             raise HTTPException(409, 'Wait for extraction to finish; failed documents cannot be exported.')
-        records.append(prepared_model_record(s)[0] if payload.mode == 'model' else raw_record(s))
+        if payload.mode == 'model' and s.get('batch_id'):
+            if not s['model_ready']:
+                raise HTTPException(422, 'A selected application needs data review.')
+            records.append(s['classifier_record'])
+        else:
+            records.append(prepared_model_record(s)[0] if payload.mode == 'model' else raw_record(s))
     if payload.mode == 'model':
         from backend.pipeline.validation import validate_records
         valid, errors = validate_records(records)
@@ -610,6 +729,11 @@ def preview_inputs(screening_id: str, payload: DataInput):
     s = get_screening(screening_id)
     if s['status'] not in ('ready', 'completed'):
         raise HTTPException(409, 'Wait for extraction to finish before checking model inputs.')
+    if s.get('batch_id'):
+        preview = prepare_batch_profile(s, find_job(s['job_id']), {**s.get('corrections', {}), **payload.data})
+        if preview['route'] == 'review':
+            raise HTTPException(422, {'message': 'Some fields need review.', 'fields': preview['field_issues']})
+        return preview
     data = dict(payload.data)
     errors = validate_confirmed(data)
     if errors:
@@ -623,6 +747,8 @@ def predict(application_id: str):
         raise HTTPException(503, model_error or 'Model unavailable.')
     if application_id in state['screenings']:
         s = state['screenings'][application_id]
+        if s.get('batch_id'):
+            raise HTTPException(409, 'Run the model from this application’s batch.')
         if s['status'] not in ('ready', 'completed'):
             raise HTTPException(409, 'Wait for extraction to finish before running the model.')
         raw, imputed_fields = prepared_model_record(s)
@@ -644,7 +770,7 @@ def predict(application_id: str):
         pipeline_result = scored[0]
         probability = pipeline_result['Model_Score']
     except Exception as exc:
-        logging.exception('Prediction failed')
+        logging.error('Prediction failed (%s)', type(exc).__name__)
         raise HTTPException(503, 'The model could not score this record. Its segment was not changed.') from exc
     result = {'probability': probability, 'segment': segment(probability), 'threshold': float(artifact['threshold']),
               'model_name': artifact['model_name'], 'feature_count': len(artifact['feature_columns']),
@@ -660,6 +786,13 @@ def predict(application_id: str):
 @app.get('/api/screenings/{screening_id}/mapped-data')
 def mapped_data(screening_id: str):
     s = get_screening(screening_id)
+    if s.get('batch_id'):
+        if not s['model_ready'] or not artifact:
+            raise HTTPException(409, 'Model inputs are unavailable.')
+        features = make_features(s['classifier_record'])
+        return {'raw_record': s['classifier_record'], 'model_ready_record': s['model_ready_record'],
+                'model_inputs': {key: features[key] for key in artifact['feature_columns']},
+                'imputed_fields': s['imputed_fields'], 'feature_count': len(artifact['feature_columns'])}
     if not s['confirmed']:
         raise HTTPException(409, 'Confirm candidate data before exporting model inputs.')
     return model_mapping(s)
@@ -688,8 +821,12 @@ def segment_dataset(job_id: str = ''):
         return {'processed': len(frame), 'potential_matches': sum(r['Model_Prediction'] for r in scored),
                 'threshold': float(artifact['threshold'])}
     except Exception as exc:
-        logging.exception('Dataset segmentation failed')
+        logging.error('Dataset segmentation failed (%s)', type(exc).__name__)
         raise HTTPException(503, 'The model could not segment these applications. Please check model compatibility.') from exc
 
 
+from backend.batch_screening import (router, finish_batch_extraction, prepare_batch_profile,
+                                     correct_batch_profile, invalidate_assessment)
+
+app.include_router(router)
 app.mount('/', StaticFiles(directory=ROOT / 'frontend', html=True), name='frontend')

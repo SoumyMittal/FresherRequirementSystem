@@ -16,6 +16,21 @@ def parse_list(value):
     return [part.strip() for part in str(value).split(',') if part.strip()]
 
 
+def normalize_number(field, value):
+    lower, upper, integer = NUMERIC_BOUNDS[field]
+    if isinstance(value, bool):
+        raise ValueError('Enter a number.')
+    try:
+        number = float(value)
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError('Enter a number.') from None
+    if not math.isfinite(number) or number < lower or (upper is not None and number > upper):
+        raise ValueError(f'Use a value between {lower} and {upper}.' if upper is not None else f'Use a value of at least {lower}.')
+    if integer and not number.is_integer():
+        raise ValueError('Enter a whole number.')
+    return int(number) if integer else number
+
+
 def validate_records(records):
     ids = Counter(str(r.get('Application ID', '')).strip() for r in records)
     valid, invalid = [], []
@@ -31,16 +46,13 @@ def validate_records(records):
         app_id = str(record.get('Application ID', '')).strip()
         if app_id and ids[app_id] > 1:
             reasons.append('Application ID: duplicated in input')
-        for key, (lower, upper, integer) in NUMERIC_BOUNDS.items():
+        for key in NUMERIC_BOUNDS:
             value = record.get(key)
             if missing(value):
                 continue
             try:
-                number = float(value)
-                if not math.isfinite(number) or number < lower or (upper is not None and number > upper) or (integer and not number.is_integer()):
-                    raise ValueError()
-                cleaned[key] = int(number) if integer else number
-            except (ValueError, TypeError, OverflowError):
+                cleaned[key] = normalize_number(key, value)
+            except ValueError:
                 reasons.append(f'{key}: invalid numeric value')
         for key in ('Skills', 'Required Skills', 'Preferred Degree'):
             if not parse_list(record.get(key)):
